@@ -8,7 +8,7 @@ A Model Context Protocol (MCP) server that gives AI coding agents persistent, ev
 |------|-------------|
 | `memory_list_lobes` | List all configured memory lobes (knowledge scopes per repo) with paths and usage stats |
 | `memory_store` | Store a knowledge entry with dedup detection and preference surfacing |
-| `memory_query` | Query knowledge by scope with brief/standard/full detail levels |
+| `memory_query` | Query knowledge by scope with brief/standard/full detail levels and smart filter syntax |
 | `memory_context` | Get relevant knowledge for a task (natural language context search with topic boosting) |
 | `memory_briefing` | Get a session-start briefing (user > preferences > gotchas > architecture > ...) |
 | `memory_correct` | Correct, update, or delete an existing entry (suggests storing as preference) |
@@ -18,22 +18,37 @@ A Model Context Protocol (MCP) server that gives AI coding agents persistent, ev
 
 ## Knowledge Topics
 
-| Topic | Purpose | Expires? | Default Trust |
-|-------|---------|----------|---------------|
-| `user` | Personal info (name, role, communication style) | Never | `user` |
-| `preferences` | Corrections, opinions, coding rules | Never | `user` |
-| `gotchas` | Pitfalls and known issues | Never | `user` |
-| `architecture` | System design, patterns, module structure | 30 days | `agent-inferred` |
-| `conventions` | Code style, naming, patterns | 30 days | `agent-inferred` |
-| `modules/<name>` | Per-module knowledge | 30 days | `agent-inferred` |
-| `recent-work` | Current task context (branch-scoped) | 7 days | `agent-inferred` |
+| Topic | Purpose | Global? | Expires? | Default Trust |
+|-------|---------|---------|----------|---------------|
+| `user` | Personal info (name, role, communication style) | Yes | Never | `user` |
+| `preferences` | Corrections, opinions, coding rules | Yes | Never | `user` |
+| `gotchas` | Pitfalls and known issues | No | Never | `user` |
+| `architecture` | System design, patterns, module structure | No | 30 days | `agent-inferred` |
+| `conventions` | Code style, naming, patterns | No | 30 days | `agent-inferred` |
+| `modules/<name>` | Per-module knowledge | No | 30 days | `agent-inferred` |
+| `recent-work` | Current task context (branch-scoped) | No | 30 days | `agent-inferred` |
+
+**Global topics** (`user`, `preferences`) are stored in a shared global store at `~/.memory-mcp/global/` and are accessible from all lobes. This means your identity and coding preferences follow you across every repository without duplication.
 
 ### Smart Surfacing
 
-- **Dedup detection**: When you store an entry, the response shows similar existing entries in the same topic (>40% keyword overlap) with consolidation instructions
+- **Dedup detection**: When you store an entry, the response shows similar existing entries in the same topic (>35% keyword overlap) with consolidation instructions
 - **Preference surfacing**: Storing a non-preference entry shows relevant preferences that might conflict
 - **Piggyback hints**: `memory_correct` suggests storing corrections as reusable preferences
 - **`memory_context`**: Describe your task in natural language and get ranked results across all topics with topic-based boosting (preferences 1.8x, gotchas 1.5x)
+
+### Smart Filter Syntax
+
+`memory_query` supports a filter mini-language for precise searches:
+
+| Syntax | Meaning | Example |
+|--------|---------|---------|
+| `A B` | AND (both required) | `reducer sealed` |
+| `A\|B` | OR (either matches) | `MVI\|MVVM` |
+| `-A` | NOT (exclude) | `-deprecated` |
+| combined | Mix freely | `kotlin sealed\|swift protocol -deprecated` |
+
+Filters use stemmed matching, so `reducers` matches `reducer` and `exceptions` matches `exception`.
 
 ## Quick Start
 
@@ -71,11 +86,10 @@ Create a `memory-config.json` file next to the memory MCP server:
 
 > **Note:** `memoryDir` is optional. When omitted, storage auto-detects to `.git/memory/` for git repos.
 
-**What's a "lobe"?** Each repository gets its own memory lobe — a dedicated knowledge scope. Think of it like brain regions: the "workrail lobe" stores knowledge about workrail, the "workspace-mcp lobe" stores knowledge about workspace-mcp.
+**What's a "lobe"?** Each repository gets its own memory lobe -- a dedicated knowledge scope. Think of it like brain regions: the "workrail lobe" stores knowledge about workrail, the "workspace-mcp lobe" stores knowledge about workspace-mcp.
 
 **Benefits:**
 - Portable (`$HOME` and `~` expansion works across machines)
-- Versioned (checked into git)
 - Discoverable (use `memory_list_lobes` to see what's configured)
 - Easy to extend (just add a new lobe entry)
 
@@ -85,7 +99,7 @@ If no `memory-config.json` is found, the server falls back to environment variab
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MEMORY_MCP_WORKSPACES` | — | JSON mapping workspace names to repo paths (multi-repo mode) |
+| `MEMORY_MCP_WORKSPACES` | -- | JSON mapping workspace names to repo paths (multi-repo mode) |
 | `MEMORY_MCP_REPO_ROOT` | `process.cwd()` | Fallback: single-repo path (if `WORKSPACES` not set) |
 | `MEMORY_MCP_DIR` | *(auto-detect)* | Override storage dir (relative to repo root, or absolute). Disables git-native auto-detection. |
 | `MEMORY_MCP_BUDGET` | `2097152` (2MB) | Storage budget per workspace in bytes |
@@ -105,7 +119,7 @@ If no `memory-config.json` is found, the server falls back to environment variab
 
 The agent will see the new lobe in tool descriptions and can immediately use it with `memory_store(lobe: "my-project", ...)`.
 
-## Firebender Registration
+## MCP Client Registration
 
 With `memory-config.json` (recommended):
 
@@ -120,9 +134,9 @@ With `memory-config.json` (recommended):
 }
 ```
 
-The server reads `memory-config.json` automatically — no env vars needed.
+The server reads `memory-config.json` automatically -- no env vars needed.
 
-### Legacy: Environment Variable Mode
+### Environment Variable Mode
 
 ```json
 {
@@ -140,14 +154,14 @@ The server reads `memory-config.json` automatically — no env vars needed.
 
 ## Storage Location
 
-Knowledge is stored as human-readable Markdown files — **one file per entry**. The storage location is **auto-detected** with the following priority:
+Knowledge is stored as human-readable Markdown files -- **one file per entry**. The storage location is **auto-detected** with the following priority:
 
-1. **Explicit `memoryDir` config** — if set in `memory-config.json` or `MEMORY_MCP_DIR`, uses that path
-2. **Git-native** (default) — `<git-common-dir>/memory/` using `git rev-parse --git-common-dir`. This ensures:
-   - **Invisible to git** — `.git/` contents are never tracked, no `.gitignore` needed
-   - **Shared across worktrees** — all worktrees of the same repo share one memory store
-   - **Worktree/submodule safe** — resolves to the common `.git/` directory regardless
-3. **Central fallback** — `~/.memory-mcp/<lobe-name>/` for non-git directories
+1. **Explicit `memoryDir` config** -- if set in `memory-config.json` or `MEMORY_MCP_DIR`, uses that path
+2. **Git-native** (default) -- `<git-common-dir>/memory/` using `git rev-parse --git-common-dir`. This ensures:
+   - **Invisible to git** -- `.git/` contents are never tracked, no `.gitignore` needed
+   - **Shared across worktrees** -- all worktrees of the same repo share one memory store
+   - **Worktree/submodule safe** -- resolves to the common `.git/` directory regardless
+3. **Central fallback** -- `~/.memory-mcp/<lobe-name>/` for non-git directories
 
 Use `memory_stats` or `memory_list_lobes` to see where memory is stored for each lobe.
 
@@ -157,10 +171,6 @@ Each entry gets its own file. Recent-work entries are scoped by branch.
 
 ```
 .git/memory/
-  user/
-    user-3f7a2b1c.md              # Personal info
-  preferences/
-    pref-5c9b7e3d.md              # Coding opinions & corrections
   architecture/
     arch-e8d4f012.md              # One entry per file
   conventions/
@@ -175,11 +185,17 @@ Each entry gets its own file. Recent-work entries are scoped by branch.
   modules/
     messaging/
       mod-4d5e6f7g.md
+
+~/.memory-mcp/global/              # Global store (shared across all lobes)
+  user/
+    user-3f7a2b1c.md              # Personal info
+  preferences/
+    pref-5c9b7e3d.md              # Coding opinions & corrections
 ```
 
 ### Concurrency Safety
 
-Each entry is its own file with a random hex ID. Two MCP processes (e.g., Firebender + Cursor) writing different entries to the same repo **never conflict** — they write to different files. The store reloads from disk before every read to pick up changes from other processes.
+Each entry is its own file with a random hex ID. Two MCP processes (e.g., Firebender + Cursor) writing different entries to the same repo **never conflict** -- they write to different files. The store reloads from disk before every read to pick up changes from other processes.
 
 ### Branch-Scoped Recent Work
 
@@ -206,6 +222,42 @@ Detected: Node.js/TypeScript project (npm)
 | `user` | 1.0 | Human-provided or human-corrected knowledge |
 | `agent-confirmed` | 0.85 | Agent-observed and verified against code |
 | `agent-inferred` | 0.70 | Agent-observed, not yet verified |
+
+## Resilience
+
+The server uses a **degradation ladder** to stay useful even when things go wrong:
+
+- **Running** -- all lobes healthy, full functionality
+- **Degraded** -- some lobes failed to initialize but healthy ones continue working. Failed lobes report specific recovery steps via `memory_diagnose`.
+- **Safe Mode** -- all lobes failed. Only `memory_diagnose` and `memory_list_lobes` work, giving you enough information to fix the problem.
+
+**Crash journaling**: On uncaught exceptions, the server writes a structured crash report to `~/.memory-mcp/crashes/` before exiting. The next startup surfaces the crash in `memory_briefing` with recovery steps. Use `memory_diagnose(showCrashHistory: true)` to see the full history.
+
+### Argument Normalization
+
+Agents frequently guess wrong parameter names. The server silently resolves common aliases to avoid wasted round-trips:
+
+| Alias | Resolves to |
+|-------|-------------|
+| `key`, `name` | `title` |
+| `value`, `body`, `text` | `content` |
+| `query`, `search` | `filter` |
+| `workspace`, `repo` | `lobe` |
+
+Wildcard scope aliases (`all`, `everything`, `global`, `project`) resolve to `*`.
+
+## Architecture
+
+```
+types.ts          Domain types (discriminated unions, parse functions)
+store.ts          MarkdownMemoryStore (CRUD, search, bootstrap, briefing)
+text-analyzer.ts  Keyword extraction, stemming, similarity (stateless)
+normalize.ts      Argument alias resolution (pure)
+config.ts         3-tier config loading (file > env > default)
+git-service.ts    Git operations boundary (injectable for testing)
+crash-journal.ts  Crash report lifecycle (build, write, read, format)
+index.ts          MCP server, tool handlers, startup, migration
+```
 
 ## Design
 
