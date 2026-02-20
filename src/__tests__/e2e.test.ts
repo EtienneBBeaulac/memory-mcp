@@ -244,15 +244,18 @@ describe('E2E: MCP Server', () => {
       assert.ok(Array.isArray(tools), 'Should return an array of tools');
 
       const toolNames = tools.map(t => t.name);
+      // 5 visible tools
       assert.ok(toolNames.includes('memory_store'), 'Should have memory_store');
       assert.ok(toolNames.includes('memory_query'), 'Should have memory_query');
       assert.ok(toolNames.includes('memory_correct'), 'Should have memory_correct');
       assert.ok(toolNames.includes('memory_context'), 'Should have memory_context');
-      assert.ok(toolNames.includes('memory_briefing'), 'Should have memory_briefing');
-      assert.ok(toolNames.includes('memory_stats'), 'Should have memory_stats');
       assert.ok(toolNames.includes('memory_bootstrap'), 'Should have memory_bootstrap');
-      assert.ok(toolNames.includes('memory_diagnose'), 'Should have memory_diagnose');
-      assert.ok(toolNames.includes('memory_list_lobes'), 'Should have memory_list_lobes');
+      // Hidden tools — still callable but not in the catalog
+      assert.ok(!toolNames.includes('memory_briefing'), 'Should NOT have memory_briefing (replaced by memory_context)');
+      assert.ok(!toolNames.includes('memory_diagnose'), 'Should NOT list memory_diagnose (hidden)');
+      assert.ok(!toolNames.includes('memory_stats'), 'Should NOT list memory_stats (hidden)');
+      assert.ok(!toolNames.includes('memory_list_lobes'), 'Should NOT list memory_list_lobes (hidden)');
+      assert.strictEqual(toolNames.length, 5, 'Should have exactly 5 visible tools');
     });
   });
 
@@ -422,14 +425,21 @@ describe('E2E: MCP Server', () => {
     });
   });
 
-  describe('briefing', () => {
-    it('generates a session briefing', async () => {
-      const response = await client.callTool('memory_briefing', {});
+  describe('briefing mode (memory_context with no args)', () => {
+    it('generates a session briefing when context is omitted', async () => {
+      const response = await client.callTool('memory_context', {});
       assert.ok(!client.isError(response));
       const text = client.getText(response);
-      // Should mention at least some of the seeded entries
+      // Should have meaningful content (user + preferences + stale nudges)
       assert.ok(text.length > 50, 'Briefing should have meaningful content');
       assert.ok(text.includes('memory_context'), 'Briefing should mention memory_context for task-specific lookup');
+    });
+
+    it('memory_diagnose still works when called directly (hidden tool)', async () => {
+      const response = await client.callTool('memory_diagnose', {});
+      assert.ok(!client.isError(response));
+      const text = client.getText(response);
+      assert.ok(text.includes('Diagnostics') || text.includes('Server mode'), 'Should return diagnostics');
     });
   });
 

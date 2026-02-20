@@ -1,0 +1,178 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+# Prevent concurrent releases
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main'
+
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      # npm Trusted Publishing (OIDC) requires npm >= 11.5.1
+      - name: Upgrade npm (Trusted Publishing)
+        run: |
+          npm --version
+          npm install -g npm@11.6.2
+          npm --version
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Download build artifact (dist/)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+          name: dist
+          path: dist
+
+      - name: Verify dist artifacts
+        run: |
+          echo "Checking build artifacts..."
+          ls -la dist/
+          test -f dist/index.js || (echo "Missing dist/index.js" && exit 1)
+          test -f dist/ephemeral-weights.json || (echo "Missing dist/ephemeral-weights.json" && exit 1)
+          echo "Build artifacts verified."
+
+      - name: Capture pre-release tag
+        run: |
+          PRE_TAG="$(git describe --tags --abbrev=0 --match "v*" 2>/dev/null || true)"
+          echo "PRE_RELEASE_TAG=$PRE_TAG" >> "$GITHUB_ENV"
+
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Ensure we use the upgraded global npm (OIDC requires npm >= 11.5.1).
+          # npx prepends ./node_modules/.bin to PATH, which can shadow the global npm.
+          export PATH="$(echo "$PATH" | tr ':' '\n' | awk '!/\/node_modules\/\.bin/' | paste -sd ':' -)"
+          hash -r
+
+          node ./node_modules/semantic-release/bin/semantic-release.js
+
+      - name: Cleanup tag on failed publish
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          POST_TAG="$(git describe --tags --abbrev=0 --match "v*" 2>/dev/null || true)"
+
+          # Only clean up if a new tag was created during this run.
+          if [ -z "${POST_TAG}" ] || [ "${POST_TAG}" = "${PRE_RELEASE_TAG:-}" ]; then
+            echo "RELEASE_TAG_CLEANUP_STATUS=none" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          TAG_SHA="$(git rev-list -n 1 "${POST_TAG}")"
+          if [ "${TAG_SHA}" != "${CI_SHA}" ]; then
+            echo "Refusing to delete ${POST_TAG}: tag sha ${TAG_SHA} != run sha ${CI_SHA}"
+            exit 1
+          fi
+
+          VERSION="${POST_TAG#v}"
+
+          # If npm already has this version, keep the tag.
+          if npm view "@exaudeus/memory-mcp@${VERSION}" version >/dev/null 2>&1; then
+            echo "Version ${VERSION} exists on npm; keeping tag ${POST_TAG}"
+            echo "RELEASE_TAG_CLEANUP_STATUS=kept_published" >> "$GITHUB_ENV"
+            echo "RELEASE_TAG_CLEANUP_TAG=${POST_TAG}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "Deleting tag ${POST_TAG} (${TAG_SHA}) from origin"
+          git push origin ":refs/tags/${POST_TAG}"
+
+          # Delete GitHub Release if it exists.
+          gh release delete "${POST_TAG}" -y || true
+
+          echo "RELEASE_TAG_CLEANUP_STATUS=deleted" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG_CLEANUP_TAG=${POST_TAG}" >> "$GITHUB_ENV"
+
+      - name: Release summary
+        if: always()
+        env:
+          CI_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+          JOB_STATUS: ${{ job.status }}
+          RELEASE_TAG_CLEANUP_STATUS: ${{ env.RELEASE_TAG_CLEANUP_STATUS }}
+          RELEASE_TAG_CLEANUP_TAG: ${{ env.RELEASE_TAG_CLEANUP_TAG }}
+        run: |
+          POST_TAG="$(git describe --tags --abbrev=0 --match "v*" 2>/dev/null || true)"
+
+          if [ "${JOB_STATUS}" = "failure" ]; then
+            if [ "${RELEASE_TAG_CLEANUP_STATUS:-}" = "deleted" ]; then
+              OUTCOME_LINE="Failed (deleted ${RELEASE_TAG_CLEANUP_TAG}; will retry next run)"
+              echo "::error title=Release outcome::Failed; deleted ${RELEASE_TAG_CLEANUP_TAG} to allow retry"
+            elif [ "${RELEASE_TAG_CLEANUP_STATUS:-}" = "kept_published" ]; then
+              OUTCOME_LINE="Failed (kept ${RELEASE_TAG_CLEANUP_TAG}; version already on npm)"
+              echo "::error title=Release outcome::Failed; kept ${RELEASE_TAG_CLEANUP_TAG} (version already on npm)"
+            else
+              OUTCOME_LINE="Failed"
+              echo "::error title=Release outcome::Failed"
+            fi
+          else
+            if [ -n "$POST_TAG" ] && [ "$POST_TAG" != "${PRE_RELEASE_TAG:-}" ]; then
+              echo "::notice title=Release outcome::Released ${POST_TAG}"
+              OUTCOME_LINE="Released ${POST_TAG}"
+              TAG_LINE="- Tag: ${POST_TAG}"
+              RELEASE_LINE="- GitHub Release: https://github.com/${REPO}/releases/tag/${POST_TAG}"
+            else
+              echo "::notice title=Release outcome::No release (no version bump)"
+              OUTCOME_LINE="No release (no version bump)"
+              TAG_LINE="- Tag: (no release created)"
+              RELEASE_LINE=""
+            fi
+          fi
+
+          TAG_LINE="${TAG_LINE:-}";
+          RELEASE_LINE="${RELEASE_LINE:-}";
+
+          {
+            echo "## Release Summary"
+            echo
+            echo "- Outcome: ${OUTCOME_LINE}"
+            echo "- CI run: ${CI_RUN_URL} (run_id=${CI_RUN_ID})"
+            echo "- Commit: ${CI_SHA}"
+            if [ -n "${TAG_LINE}" ]; then
+              echo "${TAG_LINE}"
+            fi
+            if [ -n "${RELEASE_LINE}" ]; then
+              echo "${RELEASE_LINE}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

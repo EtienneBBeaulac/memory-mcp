@@ -6,15 +6,14 @@ A Model Context Protocol (MCP) server that gives AI coding agents persistent, ev
 
 | Tool | Description |
 |------|-------------|
-| `memory_list_lobes` | List all configured memory lobes (knowledge scopes per repo) with paths and usage stats |
-| `memory_store` | Store a knowledge entry with dedup detection and preference surfacing |
-| `memory_query` | Query knowledge by scope with brief/standard/full detail levels and smart filter syntax |
-| `memory_context` | Get relevant knowledge for a task (natural language context search with topic boosting) |
-| `memory_briefing` | Get a session-start briefing (user > preferences > gotchas > architecture > ...) |
+| `memory_context` | Session start AND pre-task lookup. Call with no args for user + preferences + stale nudges; call with `context` for task-specific knowledge |
+| `memory_query` | Structured search with brief/standard/full detail levels and AND/OR/NOT filter syntax. Scope defaults to `"*"` (all topics) |
+| `memory_store` | Store a knowledge entry with dedup detection, preference surfacing, and lobe auto-detection from file paths |
 | `memory_correct` | Correct, update, or delete an existing entry (suggests storing as preference) |
-| `memory_stats` | View health stats: entries, trust breakdown, freshness, storage usage |
 | `memory_bootstrap` | First-use scan to seed knowledge from repo structure, README, and build files |
-| `memory_diagnose` | Health check: server status, per-lobe health, crash history, and recovery steps |
+
+> **Hidden tools** (still callable, not in the catalog — agents learn about them from hints/errors):
+> `memory_list_lobes` (lobe paths and stats), `memory_stats` (entry counts, freshness, storage), `memory_diagnose` (server health, crash history, recovery steps)
 
 ## Knowledge Topics
 
@@ -199,7 +198,7 @@ Each entry is its own file with a random hex ID. Two MCP processes (e.g., Firebe
 
 ### Branch-Scoped Recent Work
 
-Recent-work entries are automatically tagged with the current git branch and stored in a branch-named subdirectory. `memory_briefing` and `memory_query` filter recent-work to the current branch by default. Use `branch: "*"` to see recent-work from all branches.
+Recent-work entries are automatically tagged with the current git branch and stored in a branch-named subdirectory. `memory_query` filters recent-work to the current branch by default. Use `branch: "*"` to see recent-work from all branches.
 
 ### Entry Format
 
@@ -231,7 +230,7 @@ The server uses a **degradation ladder** to stay useful even when things go wron
 - **Degraded** -- some lobes failed to initialize but healthy ones continue working. Failed lobes report specific recovery steps via `memory_diagnose`.
 - **Safe Mode** -- all lobes failed. Only `memory_diagnose` and `memory_list_lobes` work, giving you enough information to fix the problem.
 
-**Crash journaling**: On uncaught exceptions, the server writes a structured crash report to `~/.memory-mcp/crashes/` before exiting. The next startup surfaces the crash in `memory_briefing` with recovery steps. Use `memory_diagnose(showCrashHistory: true)` to see the full history.
+**Crash journaling**: On uncaught exceptions, the server writes a structured crash report to `~/.memory-mcp/crashes/` before exiting. The next startup surfaces the crash in `memory_context()` (briefing mode) with recovery steps. Use `memory_diagnose(showCrashHistory: true)` to see the full history.
 
 ### Argument Normalization
 
@@ -253,6 +252,7 @@ types.ts          Domain types (discriminated unions, parse functions)
 store.ts          MarkdownMemoryStore (CRUD, search, bootstrap, briefing)
 text-analyzer.ts  Keyword extraction, stemming, similarity (stateless)
 normalize.ts      Argument alias resolution (pure)
+formatters.ts     Response formatters for tool handlers (pure)
 config.ts         3-tier config loading (file > env > default)
 git-service.ts    Git operations boundary (injectable for testing)
 crash-journal.ts  Crash report lifecycle (build, write, read, format)

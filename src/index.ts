@@ -15,20 +15,17 @@ import path from 'path';
 import os from 'os';
 import { existsSync, writeFileSync } from 'fs';
 import { MarkdownMemoryStore } from './store.js';
-import type { DetailLevel, TopicScope, TrustLevel, MemoryStats, StaleEntry, ConflictPair, BehaviorConfig } from './types.js';
+import type { DetailLevel, TopicScope, TrustLevel } from './types.js';
 import { DEFAULT_STORAGE_BUDGET_BYTES, parseTopicScope, parseTrustLevel } from './types.js';
 import { getLobeConfigs, type ConfigOrigin } from './config.js';
 import { ConfigManager } from './config-manager.js';
-import {
-  DEFAULT_STALE_DAYS_STANDARD, DEFAULT_STALE_DAYS_PREFERENCES,
-  DEFAULT_MAX_STALE_IN_BRIEFING, DEFAULT_MAX_DEDUP_SUGGESTIONS, DEFAULT_MAX_CONFLICT_PAIRS,
-} from './thresholds.js';
 import { normalizeArgs } from './normalize.js';
 import {
   buildCrashReport, writeCrashReport, writeCrashReportSync, readLatestCrash,
   readCrashHistory, clearLatestCrash, formatCrashReport, formatCrashSummary,
   markServerStarted, type CrashContext, type CrashReport,
 } from './crash-journal.js';
+import { formatStaleSection, formatConflictWarning, formatStats, formatBehaviorConfigSection } from './formatters.js';
 
 // --- Server health state ---
 // Tracks the degradation ladder: Running -> Degraded -> SafeMode
@@ -177,6 +174,32 @@ function contextError(ctx: ToolContext & { ok: false }) {
   };
 }
 
+/** Infer lobe from file paths by matching against known repo roots.
+ *  Returns the lobe name if exactly one lobe matches, undefined otherwise.
+ *  Ambiguous matches (multiple lobes) return undefined — better to ask than guess wrong. */
+function inferLobeFromPaths(paths: readonly string[]): string | undefined {
+  if (paths.length === 0) return undefined;
+
+  const lobeNames = configManager.getLobeNames();
+  const matchedLobes = new Set<string>();
+
+  for (const filePath of paths) {
+    // Resolve path to absolute for matching
+    const resolved = path.isAbsolute(filePath) ? filePath : filePath;
+    for (const lobeName of lobeNames) {
+      const config = configManager.getLobeConfig(lobeName);
+      if (!config) continue;
+      // Check if the file path starts with or is inside the repo root
+      if (resolved.startsWith(config.repoRoot) || resolved.startsWith(path.basename(config.repoRoot))) {
+        matchedLobes.add(lobeName);
+      }
+    }
+  }
+
+  // Only return if unambiguous — exactly one lobe matched
+  return matchedLobes.size === 1 ? matchedLobes.values().next().value : undefined;
+}
+
 const server = new Server(
   { name: 'memory-mcp', version: '0.1.0' },
   { capabilities: { tools: {} } }
@@ -188,7 +211,7 @@ const lobeProperty = {
   type: 'string' as const,
   description: isSingleLobe
     ? `Memory lobe name (defaults to "${lobeNames[0]}" if omitted)`
-    : `Memory lobe name. Required for non-global topics. Available: ${lobeNames.join(', ')}. Not needed for topic "user" or "preferences" (they are global).`,
+    : `Memory lobe name. Optional for reads (query/context/briefing/stats search all lobes when omitted). Required for writes (store/correct/bootstrap). Available: ${lobeNames.join(', ')}`,
   enum: lobeNames.length > 1 ? lobeNames : undefined,
 };
 
@@ -201,14 +224,8 @@ function configFileDisplay(): string {
 // --- Tool definitions ---
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
-    {
-      name: 'memory_list_lobes',
-      description: 'List available memory lobes (repos). Shows names, paths, entry counts.',
-      inputSchema: {
-        type: 'object' as const,
-        properties: {},
-      },
-    },
+    // memory_list_lobes is hidden — lobe info is surfaced in memory_context() hints
+    // and memory_stats. The handler still works if called directly.
     {
       name: 'memory_store',
       description: 'Store knowledge. "user" and "preferences" are global (no lobe needed). Example: memory_store(topic: "gotchas", title: "Build cache", content: "Must clean build after Tuist changes")',
@@ -253,14 +270,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'memory_query',
-      description: 'Search stored knowledge. Example: memory_query(scope: "*", filter: "reducer sealed", detail: "full"). Use scope "*" to search everything. Use detail "full" for complete content.',
+      description: 'Search stored knowledge. Searches all lobes when lobe is omitted. Example: memory_query(scope: "*", filter: "reducer sealed", detail: "full"). Use scope "*" to search everything. Use detail "full" for complete content.',
       inputSchema: {
         type: 'object' as const,
         properties: {
           lobe: lobeProperty,
           scope: {
             type: 'string',
-            description: '* (all topics) | user | preferences | architecture | conventions | gotchas | recent-work | modules/<name>',
+            description: 'Optional. Defaults to "*" (all topics). Options: * | user | preferences | architecture | conventions | gotchas | recent-work | modules/<name>',
           },
           detail: {
             type: 'string',
@@ -277,27 +294,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: 'Branch for recent-work. Omit = current branch, "*" = all branches.',
           },
         },
-        required: ['scope'],
+        required: [],
       },
     },
-    {
-      name: 'memory_briefing',
-      description: 'Session start: get all known knowledge summarized. Call at the beginning of every session. Omit lobe for a cross-repo briefing.',
-      inputSchema: {
-        type: 'object' as const,
-        properties: {
-          lobe: {
-            type: 'string' as const,
-            description: `Optional. Omit = all lobes. Available: ${lobeNames.join(', ')}`,
-          },
-          maxTokens: {
-            type: 'number',
-            description: 'Max tokens (default: 200)',
-            default: 200,
-          },
-        },
-      },
-    },
+
     {
       name: 'memory_correct',
       description: 'Fix or delete an entry. Example: memory_correct(id: "arch-3f7a", action: "replace", correction: "updated content")',
@@ -324,14 +324,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'memory_context',
-      description: 'Pre-task lookup: describe what you are about to do, get relevant knowledge. Searches all topics, boosts preferences and gotchas. Example: memory_context(context: "writing a Kotlin reducer for messaging")',
+      description: 'Session start AND pre-task lookup. Call with no args at session start to get user identity, preferences, and stale entries. Call with context to get task-specific knowledge. Searches all lobes when lobe is omitted. Example: memory_context() or memory_context(context: "writing a Kotlin reducer")',
       inputSchema: {
         type: 'object' as const,
         properties: {
           lobe: lobeProperty,
           context: {
             type: 'string',
-            description: 'What you are about to do, in natural language',
+            description: 'Optional. What you are about to do, in natural language. Omit for session-start briefing (user + preferences + stale entries).',
           },
           maxResults: {
             type: 'number',
@@ -344,22 +344,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             default: 0.2,
           },
         },
-        required: ['context'],
+        required: [],
       },
     },
-    {
-      name: 'memory_stats',
-      description: 'Health check: entry counts, topic/trust breakdown, freshness, storage used.',
-      inputSchema: {
-        type: 'object' as const,
-        properties: {
-          lobe: {
-            type: 'string' as const,
-            description: `Optional. Omit = all lobes. Available: ${lobeNames.join(', ')}`,
-          },
-        },
-      },
-    },
+    // memory_stats is hidden — agents rarely need it proactively. Mentioned in
+    // hints when storage is running low. The handler still works if called directly.
     {
       name: 'memory_bootstrap',
       description: 'First-time setup: scan repo structure, README, and build system to seed initial knowledge. Run once per new codebase.',
@@ -371,20 +360,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: [],
       },
     },
-    {
-      name: 'memory_diagnose',
-      description: 'Health check: shows server status, per-lobe health, crash history, and recovery steps. Call this if the MCP seems broken or was recently restarted.',
-      inputSchema: {
-        type: 'object' as const,
-        properties: {
-          showCrashHistory: {
-            type: 'boolean',
-            description: 'Include full crash history (default: false, shows only latest)',
-            default: false,
-          },
-        },
-      },
-    },
+    // memory_diagnose is intentionally hidden from the tool list — it clutters
+    // agent tool discovery and should only be called when directed by error messages
+    // or crash reports. The handler still works if called directly.
   ],
 }));
 
@@ -468,9 +446,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Trust is already validated by Zod enum, but use our parser for consistency
         const trust = parseTrustLevel(rawTrust) ?? 'agent-inferred';
 
+        // Auto-detect lobe from file paths when lobe is omitted and multiple lobes exist
+        let effectiveLobe = rawLobe;
+        if (!effectiveLobe && configManager.getLobeNames().length > 1) {
+          const allPaths = [...sources, ...references];
+          effectiveLobe = inferLobeFromPaths(allPaths);
+        }
+
         // Resolve store — after this point, rawLobe is never used again
         const isGlobal = GLOBAL_TOPICS.has(topic);
-        const ctx = resolveToolContext(rawLobe, { isGlobal });
+        const ctx = resolveToolContext(effectiveLobe, { isGlobal });
         if (!ctx.ok) return contextError(ctx);
 
         const result = await ctx.store.store(
@@ -538,29 +523,68 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'memory_query': {
         const { lobe: rawLobe, scope, detail, filter, branch } = z.object({
           lobe: z.string().optional(),
-          scope: z.string(),
+          scope: z.string().default('*'),
           detail: z.enum(['brief', 'standard', 'full']).default('brief'),
           filter: z.string().optional(),
           branch: z.string().optional(),
-        }).parse(args);
+        }).parse(args ?? {});
 
-        // Resolve store — after this point, rawLobe is never used again
         const isGlobalQuery = GLOBAL_TOPICS.has(scope);
-        const ctx = resolveToolContext(rawLobe, { isGlobal: isGlobalQuery });
-        if (!ctx.ok) return contextError(ctx);
 
-        // branch: undefined = current branch, "*" = all branches, "name" = specific branch
-        const result = await ctx.store.query(scope, detail as DetailLevel, filter, branch);
+        // For global topics (user, preferences), always route to global store.
+        // For lobe topics: if lobe specified → single lobe. If omitted → ALL healthy lobes.
+        let lobeEntries: import('./types.js').QueryEntry[] = [];
+        const entryLobeMap = new Map<string, string>(); // entry id → lobe name (for cross-lobe labeling)
+        let label: string;
+        let primaryStore: MarkdownMemoryStore | undefined;
+        let isMultiLobe = false;
 
-        // For wildcard queries, also include global store entries
-        let globalEntries: typeof result.entries = [];
-        if (scope === '*' && !isGlobalQuery) {
-          const globalResult = await globalStore.query('*', detail as DetailLevel, filter);
-          globalEntries = globalResult.entries;
+        if (isGlobalQuery) {
+          const ctx = resolveToolContext(rawLobe, { isGlobal: true });
+          if (!ctx.ok) return contextError(ctx);
+          label = ctx.label;
+          primaryStore = ctx.store;
+          const result = await ctx.store.query(scope, detail as DetailLevel, filter, branch);
+          for (const e of result.entries) entryLobeMap.set(e.id, 'global');
+          lobeEntries = [...result.entries];
+        } else if (rawLobe) {
+          const ctx = resolveToolContext(rawLobe);
+          if (!ctx.ok) return contextError(ctx);
+          label = ctx.label;
+          primaryStore = ctx.store;
+          const result = await ctx.store.query(scope, detail as DetailLevel, filter, branch);
+          lobeEntries = [...result.entries];
+        } else {
+          // Search all healthy lobes — read operations shouldn't require lobe selection
+          const allLobeNames = configManager.getLobeNames();
+          isMultiLobe = allLobeNames.length > 1;
+          label = allLobeNames.length === 1 ? allLobeNames[0] : 'all';
+          for (const lobeName of allLobeNames) {
+            const store = configManager.getStore(lobeName);
+            if (!store) continue;
+            if (!primaryStore) primaryStore = store;
+            const result = await store.query(scope, detail as DetailLevel, filter, branch);
+            for (const e of result.entries) entryLobeMap.set(e.id, lobeName);
+            lobeEntries.push(...result.entries);
+          }
         }
 
-        // Merge global + lobe entries, sort by relevance score (title-weighted when filtered)
-        const allEntries = [...globalEntries, ...result.entries]
+        // For wildcard queries on non-global topics, also include global store entries
+        let globalEntries: typeof lobeEntries = [];
+        if (scope === '*' && !isGlobalQuery) {
+          const globalResult = await globalStore.query('*', detail as DetailLevel, filter);
+          for (const e of globalResult.entries) entryLobeMap.set(e.id, 'global');
+          globalEntries = [...globalResult.entries];
+        }
+
+        // Merge global + lobe entries, dedupe by id, sort by relevance score
+        const seenQueryIds = new Set<string>();
+        const allEntries = [...globalEntries, ...lobeEntries]
+          .filter(e => {
+            if (seenQueryIds.has(e.id)) return false;
+            seenQueryIds.add(e.id);
+            return true;
+          })
           .sort((a, b) => b.relevanceScore - a.relevanceScore);
 
         if (allEntries.length === 0) {
@@ -570,19 +594,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return {
             content: [{
               type: 'text',
-              text: `[${ctx.label}] No entries found for scope "${scope}"${filter ? ` with filter "${filter}"` : ''}.${scopeHint}`,
+              text: `[${label}] No entries found for scope "${scope}"${filter ? ` with filter "${filter}"` : ''}.${scopeHint}`,
             }],
           };
         }
 
         const lines = allEntries.map(e => {
           const freshIndicator = e.fresh ? '' : ' [stale]';
+          const lobeTag = isMultiLobe ? ` [${entryLobeMap.get(e.id) ?? '?'}]` : '';
           if (detail === 'brief') {
-            return `- **${e.title}** (${e.id}, confidence: ${e.confidence})${freshIndicator}\n  ${e.summary}`;
+            return `- **${e.title}** (${e.id}${lobeTag}, confidence: ${e.confidence})${freshIndicator}\n  ${e.summary}`;
           }
           if (detail === 'full') {
             const meta = [
               `ID: ${e.id}`,
+              isMultiLobe ? `Lobe: ${entryLobeMap.get(e.id) ?? '?'}` : null,
               `Confidence: ${e.confidence}`,
               `Trust: ${e.trust}`,
               `Fresh: ${e.fresh}`,
@@ -595,24 +621,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             return `### ${e.title}\n${meta}\n\n${e.content}`;
           }
           if (detail === 'standard' && e.references?.length) {
-            return `### ${e.title}\n*${e.id} | confidence: ${e.confidence}${freshIndicator}*\nReferences: ${e.references.join(', ')}\n\n${e.summary}`;
+            return `### ${e.title}\n*${e.id}${lobeTag} | confidence: ${e.confidence}${freshIndicator}*\nReferences: ${e.references.join(', ')}\n\n${e.summary}`;
           }
-          return `### ${e.title}\n*${e.id} | confidence: ${e.confidence}${freshIndicator}*\n\n${e.summary}`;
+          return `### ${e.title}\n*${e.id}${lobeTag} | confidence: ${e.confidence}${freshIndicator}*\n\n${e.summary}`;
         });
 
         const totalCount = allEntries.length;
-        let text = `## [${ctx.label}] Query: ${scope} (${totalCount} entries)\n\n${lines.join('\n\n')}`;
+        let text = `## [${label}] Query: ${scope} (${totalCount} entries)\n\n${lines.join('\n\n')}`;
 
         // Conflict detection: compare entry pairs in the result set.
-        // Fetch raw entries (which have full content) for the matching IDs.
-        const rawEntries = ctx.store.getEntriesByIds(result.entries.map(e => e.id));
-        const conflicts = ctx.store.detectConflicts(rawEntries);
-        if (conflicts.length > 0) {
-          text += '\n\n' + formatConflictWarning(conflicts);
+        if (primaryStore) {
+          const rawEntries = primaryStore.getEntriesByIds(allEntries.map(e => e.id));
+          const conflicts = primaryStore.detectConflicts(rawEntries);
+          if (conflicts.length > 0) {
+            text += '\n\n' + formatConflictWarning(conflicts);
+          }
         }
 
         // Hints: teach the agent about capabilities it may not know about
         const hints: string[] = [];
+
+        // Nudge: when searching all lobes, remind the agent to specify one for targeted results
+        const allQueryLobeNames = configManager.getLobeNames();
+        if (!rawLobe && !isGlobalQuery && allQueryLobeNames.length > 1) {
+          hints.push(`Searched all lobes. For targeted results use lobe: "${allQueryLobeNames[0]}" (available: ${allQueryLobeNames.join(', ')}).`);
+        }
+
         if (detail !== 'full') {
           hints.push('Use detail: "full" to see complete entry content.');
         }
@@ -625,102 +659,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (hints.length > 0) {
           text += `\n\n---\n*${hints.join(' ')}*`;
         }
-
-        return { content: [{ type: 'text', text }] };
-      }
-
-      case 'memory_briefing': {
-        const { lobe, maxTokens } = z.object({
-          lobe: z.string().optional(),
-          maxTokens: z.number().default(200),
-        }).parse(args ?? {});
-
-        // Surface previous crash report at the top of briefing if one exists
-        const previousCrash = await readLatestCrash();
-        const crashSection = previousCrash
-          ? `## ⚠ Previous Crash Detected\n${formatCrashSummary(previousCrash)}\nRun **memory_diagnose** for full details and recovery steps.\n`
-          : '';
-        if (previousCrash) await clearLatestCrash();
-
-        // Surface degraded lobes warning
-        const lobeNames = configManager.getLobeNames();
-        const degradedLobeNames = lobeNames.filter(n => configManager.getLobeHealth(n)?.status === 'degraded');
-        const degradedSection = degradedLobeNames.length > 0
-          ? `## ⚠ Degraded Lobes: ${degradedLobeNames.join(', ')}\nRun **memory_diagnose** for details.\n`
-          : '';
-
-        // Always include global briefing (user + preferences) at the top
-        const globalBriefing = await globalStore.briefing(Math.min(maxTokens, 300));
-        const globalSection = globalBriefing.entryCount > 0
-          ? `## Global (shared across all lobes)\n\n${globalBriefing.briefing}`
-          : '';
-
-        // Single lobe briefing
-        if (lobe) {
-          const ctx = resolveToolContext(lobe);
-          if (!ctx.ok) return contextError(ctx);
-          const result = await ctx.store.briefing(maxTokens);
-
-          const sections: string[] = [];
-          if (crashSection) sections.push(crashSection);
-          if (degradedSection) sections.push(degradedSection);
-          if (globalSection) sections.push(globalSection);
-          sections.push(`# [${ctx.label}]\n\n${result.briefing}`);
-
-          let text = sections.join('\n\n---\n\n');
-          if (result.staleDetails && result.staleDetails.length > 0) {
-            text += '\n\n' + formatStaleSection(result.staleDetails);
-          }
-          const totalCount = result.entryCount + globalBriefing.entryCount;
-          text += `\n\n---\n*${totalCount} entries (${globalBriefing.entryCount} global + ${result.entryCount} lobe) | ${result.staleEntries} stale*`;
-          if (result.suggestion) text += `\n\n${result.suggestion}`;
-          text += '\n\n*Before starting a task, use memory_context(context: "what you are about to do") for task-specific knowledge.*';
-
-          return { content: [{ type: 'text', text }] };
-        }
-
-        // Combined briefing across all lobes
-        const sections: string[] = [];
-        if (crashSection) sections.push(crashSection);
-        if (degradedSection) sections.push(degradedSection);
-        if (globalSection) sections.push(globalSection);
-
-        let totalEntries = globalBriefing.entryCount;
-        let totalStale = globalBriefing.staleEntries;
-        const allLobeNames = configManager.getLobeNames();
-        const perLobeTokens = Math.floor(maxTokens / allLobeNames.length);
-
-        for (const lobeName of allLobeNames) {
-          const health = configManager.getLobeHealth(lobeName);
-          if (health?.status === 'degraded') {
-            sections.push(`# [${lobeName}]\n\n❌ Degraded: ${health.error}`);
-            continue;
-          }
-
-          const store = configManager.getStore(lobeName);
-          if (!store) {
-            sections.push(`# [${lobeName}]\n\n⚠ Store not initialized.`);
-            continue;
-          }
-
-          const result = await store.briefing(Math.max(perLobeTokens, 100));
-          totalEntries += result.entryCount;
-          totalStale += result.staleEntries;
-
-          if (result.entryCount > 0) {
-            sections.push(`# [${lobeName}]\n\n${result.briefing}`);
-          } else {
-            sections.push(`# [${lobeName}]\n\nNo knowledge stored. Try memory_bootstrap(lobe: "${lobeName}").`);
-          }
-
-          if (result.staleDetails && result.staleDetails.length > 0) {
-            sections.push(formatStaleSection(result.staleDetails));
-          }
-        }
-
-        let text = sections.join('\n\n---\n\n');
-        text += `\n\n---\n*Total: ${totalEntries} entries (${globalBriefing.entryCount} global + ${totalEntries - globalBriefing.entryCount} across ${lobeNames.length} lobes) | ${totalStale} stale*`;
-        text += '\n\n*Before starting a task, use memory_context(context: "what you are about to do") for task-specific knowledge.*';
 
         return { content: [{ type: 'text', text }] };
       }
@@ -794,25 +732,117 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'memory_context': {
         const { lobe: rawLobe, context, maxResults, minMatch } = z.object({
           lobe: z.string().optional(),
-          context: z.string(),
+          context: z.string().optional(),
           maxResults: z.number().optional(),
           minMatch: z.number().min(0).max(1).optional(),
         }).parse(args ?? {});
 
-        // Resolve store — after this point, rawLobe is never used again
-        const ctx = resolveToolContext(rawLobe);
-        if (!ctx.ok) return contextError(ctx);
+        // --- Briefing mode: no context provided → user + preferences + stale nudges ---
+        if (!context) {
+          // Surface previous crash report at the top if one exists
+          const previousCrash = await readLatestCrash();
+          const crashSection = previousCrash
+            ? `## ⚠ Previous Crash Detected\n${formatCrashSummary(previousCrash)}\nRun **memory_diagnose** for full details and recovery steps.\n`
+            : '';
+          if (previousCrash) await clearLatestCrash();
 
+          // Surface degraded lobes warning
+          const allBriefingLobeNames = configManager.getLobeNames();
+          const degradedLobeNames = allBriefingLobeNames.filter(n => configManager.getLobeHealth(n)?.status === 'degraded');
+          const degradedSection = degradedLobeNames.length > 0
+            ? `## ⚠ Degraded Lobes: ${degradedLobeNames.join(', ')}\nRun **memory_diagnose** for details.\n`
+            : '';
+
+          // Global store holds user + preferences — always included
+          const globalBriefing = await globalStore.briefing(300);
+
+          const sections: string[] = [];
+          if (crashSection) sections.push(crashSection);
+          if (degradedSection) sections.push(degradedSection);
+
+          if (globalBriefing.entryCount > 0) {
+            sections.push(globalBriefing.briefing);
+          }
+
+          // Collect stale entries and entry counts across all lobes
+          const allStale: import('./types.js').StaleEntry[] = [];
+          if (globalBriefing.staleDetails) allStale.push(...globalBriefing.staleDetails);
+          let totalEntries = globalBriefing.entryCount;
+          let totalStale = globalBriefing.staleEntries;
+
+          for (const lobeName of allBriefingLobeNames) {
+            const health = configManager.getLobeHealth(lobeName);
+            if (health?.status === 'degraded') continue;
+            const store = configManager.getStore(lobeName);
+            if (!store) continue;
+            const lobeBriefing = await store.briefing(100); // just enough for stale data + counts
+            if (lobeBriefing.staleDetails) allStale.push(...lobeBriefing.staleDetails);
+            totalEntries += lobeBriefing.entryCount;
+            totalStale += lobeBriefing.staleEntries;
+          }
+
+          if (allStale.length > 0) {
+            sections.push(formatStaleSection(allStale));
+          }
+
+          if (sections.length === 0) {
+            sections.push('No knowledge stored yet. As you work, store observations with memory_store. Try memory_bootstrap to seed initial knowledge from the repo.');
+          }
+
+          const briefingHints: string[] = [];
+          briefingHints.push(`${totalEntries} entries${totalStale > 0 ? ` (${totalStale} stale)` : ''} across ${allBriefingLobeNames.length} ${allBriefingLobeNames.length === 1 ? 'lobe' : 'lobes'}.`);
+          briefingHints.push('Use memory_context(context: "what you are about to do") for task-specific knowledge.');
+          if (allBriefingLobeNames.length > 1) {
+            briefingHints.push(`Available lobes: ${allBriefingLobeNames.join(', ')}.`);
+          }
+
+          let text = sections.join('\n\n---\n\n');
+          text += `\n\n---\n*${briefingHints.join(' ')}*`;
+          return { content: [{ type: 'text', text }] };
+        }
+
+        // --- Search mode: context provided → keyword search across all topics ---
         const max = maxResults ?? 10;
         const threshold = minMatch ?? 0.2;
-        // Search both global store and lobe store, merge and re-rank
-        const [globalResults, lobeResults] = await Promise.all([
-          globalStore.contextSearch(context, max, undefined, threshold),
-          ctx.store.contextSearch(context, max, undefined, threshold),
-        ]);
+
+        // Determine which lobes to search.
+        // If lobe specified → single lobe. If omitted → ALL healthy lobes (cross-repo search).
+        type ContextResult = { entry: import('./types.js').MemoryEntry; score: number; matchedKeywords: string[] };
+        const allLobeResults: ContextResult[] = [];
+        const ctxEntryLobeMap = new Map<string, string>(); // entry id → lobe name
+        let label: string;
+        let primaryStore: MarkdownMemoryStore | undefined;
+        let isCtxMultiLobe = false;
+
+        if (rawLobe) {
+          const ctx = resolveToolContext(rawLobe);
+          if (!ctx.ok) return contextError(ctx);
+          label = ctx.label;
+          primaryStore = ctx.store;
+          const lobeResults = await ctx.store.contextSearch(context, max, undefined, threshold);
+          allLobeResults.push(...lobeResults);
+        } else {
+          // Search all healthy lobes — read operations shouldn't require lobe selection
+          const allLobeNames = configManager.getLobeNames();
+          isCtxMultiLobe = allLobeNames.length > 1;
+          label = allLobeNames.length === 1 ? allLobeNames[0] : 'all';
+          for (const lobeName of allLobeNames) {
+            const store = configManager.getStore(lobeName);
+            if (!store) continue;
+            if (!primaryStore) primaryStore = store;
+            const lobeResults = await store.contextSearch(context, max, undefined, threshold);
+            for (const r of lobeResults) ctxEntryLobeMap.set(r.entry.id, lobeName);
+            allLobeResults.push(...lobeResults);
+          }
+        }
+
+        // Always include global store (user + preferences)
+        const globalResults = await globalStore.contextSearch(context, max, undefined, threshold);
+        for (const r of globalResults) ctxEntryLobeMap.set(r.entry.id, 'global');
+
         // Merge, dedupe by entry id, re-sort by score, take top N
         const seenIds = new Set<string>();
-        const results = [...globalResults, ...lobeResults]
+        const results = [...globalResults, ...allLobeResults]
           .sort((a, b) => b.score - a.score)
           .filter(r => {
             if (seenIds.has(r.entry.id)) return false;
@@ -825,12 +855,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return {
             content: [{
               type: 'text',
-              text: `[${ctx.label}] No relevant knowledge found for: "${context}"\n\nThis is fine — proceed without prior context. As you learn things worth remembering, store them with memory_store.\nIf the lobe may already have knowledge, try memory_query(scope: "*") to browse all entries.`,
+              text: `[${label}] No relevant knowledge found for: "${context}"\n\nThis is fine — proceed without prior context. As you learn things worth remembering, store them with memory_store.\nTry memory_query(scope: "*") to browse all entries.`,
             }],
           };
         }
 
-        const sections: string[] = [`## [${ctx.label}] Context: "${context}"\n`];
+        const sections: string[] = [`## [${label}] Context: "${context}"\n`];
 
         // Group results by topic for readability
         const byTopic = new Map<string, typeof results>();
@@ -859,15 +889,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           for (const r of topicResults) {
             const marker = topic === 'gotchas' ? '[!] ' : topic === 'preferences' ? '[pref] ' : '';
             const keywords = r.matchedKeywords.length > 0 ? ` (matched: ${r.matchedKeywords.join(', ')})` : '';
-            sections.push(`- **${marker}${r.entry.title}**: ${r.entry.content}${keywords}`);
+            const lobeLabel = isCtxMultiLobe ? ` [${ctxEntryLobeMap.get(r.entry.id) ?? '?'}]` : '';
+            sections.push(`- **${marker}${r.entry.title}**${lobeLabel}: ${r.entry.content}${keywords}`);
           }
           sections.push('');
         }
 
         // Conflict detection on the result set (cross-topic — exactly when the agent needs it)
-        const ctxConflicts = ctx.store.detectConflicts(results.map(r => r.entry));
-        if (ctxConflicts.length > 0) {
-          sections.push(formatConflictWarning(ctxConflicts));
+        if (primaryStore) {
+          const ctxConflicts = primaryStore.detectConflicts(results.map(r => r.entry));
+          if (ctxConflicts.length > 0) {
+            sections.push(formatConflictWarning(ctxConflicts));
+          }
         }
 
         // Collect all matched keywords and topics for the dedup hint
@@ -880,6 +913,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Hints
         const ctxHints: string[] = [];
+
+        // Nudge: when searching all lobes, remind the agent to specify one for targeted results
+        const allCtxLobeNames = configManager.getLobeNames();
+        if (!rawLobe && allCtxLobeNames.length > 1) {
+          ctxHints.push(`Searched all lobes. For faster, targeted results use lobe: "${allCtxLobeNames[0]}" (available: ${allCtxLobeNames.join(', ')}).`);
+        }
+
         if (results.length >= max) {
           ctxHints.push(`Showing top ${max} results. Increase maxResults or raise minMatch to refine.`);
         }
@@ -1120,104 +1160,6 @@ async function buildDiagnosticsText(showFullCrashHistory: boolean): Promise<stri
   return sections.join('\n');
 }
 
-/** Format the active behavior config section for diagnostics.
- *  Shows effective values and marks overrides vs defaults clearly. */
-function formatBehaviorConfigSection(behavior?: BehaviorConfig): string {
-  const effectiveStaleStandard = behavior?.staleDaysStandard ?? DEFAULT_STALE_DAYS_STANDARD;
-  const effectiveStalePrefs = behavior?.staleDaysPreferences ?? DEFAULT_STALE_DAYS_PREFERENCES;
-  const effectiveMaxStale = behavior?.maxStaleInBriefing ?? DEFAULT_MAX_STALE_IN_BRIEFING;
-  const effectiveMaxDedup = behavior?.maxDedupSuggestions ?? DEFAULT_MAX_DEDUP_SUGGESTIONS;
-  const effectiveMaxConflict = behavior?.maxConflictPairs ?? DEFAULT_MAX_CONFLICT_PAIRS;
-
-  const hasOverrides = behavior && Object.keys(behavior).length > 0;
-
-  const tag = (val: number, def: number) => val !== def ? ' ← overridden' : ' (default)';
-
-  const lines = [
-    `- staleDaysStandard: ${effectiveStaleStandard}${tag(effectiveStaleStandard, DEFAULT_STALE_DAYS_STANDARD)}`,
-    `- staleDaysPreferences: ${effectiveStalePrefs}${tag(effectiveStalePrefs, DEFAULT_STALE_DAYS_PREFERENCES)}`,
-    `- maxStaleInBriefing: ${effectiveMaxStale}${tag(effectiveMaxStale, DEFAULT_MAX_STALE_IN_BRIEFING)}`,
-    `- maxDedupSuggestions: ${effectiveMaxDedup}${tag(effectiveMaxDedup, DEFAULT_MAX_DEDUP_SUGGESTIONS)}`,
-    `- maxConflictPairs: ${effectiveMaxConflict}${tag(effectiveMaxConflict, DEFAULT_MAX_CONFLICT_PAIRS)}`,
-  ];
-
-  if (!hasOverrides) {
-    lines.push('');
-    lines.push('All defaults active. To customize, add a "behavior" block to memory-config.json:');
-    lines.push('  { "behavior": { "staleDaysStandard": 14, "staleDaysPreferences": 60, "maxStaleInBriefing": 3 } }');
-  }
-
-  return lines.join('\n');
-}
-
-/** Format the stale entries section for the briefing response */
-function formatStaleSection(staleDetails: readonly StaleEntry[]): string {
-  const lines = [
-    `📋 ${staleDetails.length} stale ${staleDetails.length === 1 ? 'entry' : 'entries'} — verify accuracy or delete:`,
-    ...staleDetails.map(e => `  - ${e.id}: "${e.title}" (last accessed ${e.daysSinceAccess} days ago)`),
-    '',
-    'If still accurate: memory_correct(id: "...", action: "append", correction: "") — refreshes the timestamp',
-    'If outdated: memory_correct(id: "...", action: "replace", correction: "<updated content>") or action: "delete"',
-  ];
-  return lines.join('\n');
-}
-
-/** Format the conflict detection warning for query/context responses */
-function formatConflictWarning(conflicts: readonly ConflictPair[]): string {
-  const lines = ['⚠ Potential conflicts detected:'];
-  for (const c of conflicts) {
-    lines.push(`  - ${c.a.id}: "${c.a.title}" (confidence: ${c.a.confidence}, created: ${c.a.created.substring(0, 10)})`);
-    lines.push(`    vs ${c.b.id}: "${c.b.title}" (confidence: ${c.b.confidence}, created: ${c.b.created.substring(0, 10)})`);
-    lines.push(`    Similarity: ${(c.similarity * 100).toFixed(0)}%`);
-
-    // Guide the agent on which entry to trust
-    if (c.a.confidence !== c.b.confidence) {
-      const higher = c.a.confidence > c.b.confidence ? c.a : c.b;
-      lines.push(`    Higher confidence: ${higher.id} (${higher.confidence})`);
-    } else {
-      const newer = c.a.created > c.b.created ? c.a : c.b;
-      lines.push(`    More recent: ${newer.id} — may supersede the older entry`);
-    }
-  }
-  lines.push('');
-  lines.push('Consider: memory_correct to consolidate or clarify the difference between these entries.');
-  return lines.join('\n');
-}
-
-function formatStats(lobe: string, result: MemoryStats): string {
-  const topicLines = Object.entries(result.byTopic)
-    .map(([topic, count]) => `  - ${topic}: ${count}`)
-    .join('\n');
-
-  const trustLines = Object.entries(result.byTrust)
-    .map(([trust, count]) => `  - ${trust}: ${count}`)
-    .join('\n');
-
-  const corruptLine = result.corruptFiles > 0 ? `\n**Corrupt files:** ${result.corruptFiles}` : '';
-
-  return [
-    `## [${lobe}] Memory Stats`,
-    ``,
-    `**Memory location:** ${result.memoryPath}`,
-    `**Total entries:** ${result.totalEntries}${corruptLine}`,
-    `**Storage:** ${result.storageSize} / ${Math.round(result.storageBudgetBytes / 1024 / 1024)}MB budget`,
-    ``,
-    `### By Topic`,
-    topicLines || '  (none)',
-    ``,
-    `### By Trust Level`,
-    trustLines,
-    ``,
-    `### Freshness`,
-    `  - Fresh: ${result.byFreshness.fresh}`,
-    `  - Stale: ${result.byFreshness.stale}`,
-    `  - Unknown: ${result.byFreshness.unknown}`,
-    ``,
-    result.oldestEntry ? `Oldest: ${result.oldestEntry}` : '',
-    result.newestEntry ? `Newest: ${result.newestEntry}` : '',
-  ].filter(Boolean).join('\n');
-}
-
 // --- Startup ---
 async function main() {
   markServerStarted();
@@ -1227,7 +1169,7 @@ async function main() {
   if (previousCrash) {
     const age = Math.round((Date.now() - new Date(previousCrash.timestamp).getTime()) / 1000);
     process.stderr.write(`[memory-mcp] Previous crash detected (${age}s ago): ${previousCrash.type} — ${previousCrash.error}\n`);
-    process.stderr.write(`[memory-mcp] Crash report will be shown in memory_briefing and memory_diagnose.\n`);
+    process.stderr.write(`[memory-mcp] Crash report will be shown in memory_context and memory_diagnose.\n`);
   }
 
   // Initialize global store (user + preferences, shared across all lobes)

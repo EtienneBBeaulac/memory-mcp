@@ -67,8 +67,8 @@ export function normalizeArgs(
     }
   }
 
-  // 5. For memory_query: if filter is present but scope is missing, default scope to "*"
-  if (toolName === 'memory_query' && 'filter' in args && !('scope' in args)) {
+  // 5. For memory_query: default scope to "*" when missing
+  if (toolName === 'memory_query' && !('scope' in args)) {
     args['scope'] = '*';
   }
 

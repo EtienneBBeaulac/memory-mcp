@@ -1,25 +1,53 @@
 {
-  "name": "memory-mcp",
-  "private": true,
+  "name": "@exaudeus/memory-mcp",
   "version": "0.1.0",
   "description": "Codebase memory MCP server - persistent, evolving knowledge for AI coding agents",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "memory-mcp": "./dist/index.js"
+    "memory-mcp": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json && cp src/ephemeral-weights.json dist/",
+    "typecheck": "tsc --noEmit",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "test": "node --import tsx --test src/__tests__/**/*.test.ts"
+    "test": "node --import tsx --test src/__tests__/**/*.test.ts",
+    "prepublishOnly": "npm run build",
+    "semantic-release": "semantic-release"
   },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EtienneBBeaulac/memory-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "memory",
+    "codebase-memory",
+    "ai-agent",
+    "firebender"
+  ],
+  "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.2.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {
+    "@semantic-release/changelog": "^6.0.3",
+    "@semantic-release/exec": "^7.1.0",
+    "@semantic-release/git": "^10.0.1",
+    "@semantic-release/github": "^12.0.6",
     "@types/node": "^20.0.0",
+    "conventional-changelog-conventionalcommits": "^9.1.0",
+    "semantic-release": "^24.2.9",
     "tsx": "^4.0.0",
     "typescript": "^5.0.0"
   },
