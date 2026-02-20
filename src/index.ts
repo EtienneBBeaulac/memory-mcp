@@ -14,6 +14,7 @@ import { z } from 'zod';
 import path from 'path';
 import os from 'os';
 import { existsSync, writeFileSync } from 'fs';
+import { readFile, writeFile } from 'fs/promises';
 import { MarkdownMemoryStore } from './store.js';
 import type { DetailLevel, TopicScope, TrustLevel } from './types.js';
 import { DEFAULT_STORAGE_BUDGET_BYTES, parseTopicScope, parseTrustLevel } from './types.js';
@@ -26,6 +27,8 @@ import {
   markServerStarted, type CrashContext, type CrashReport,
 } from './crash-journal.js';
 import { formatStaleSection, formatConflictWarning, formatStats, formatBehaviorConfigSection } from './formatters.js';
+import { extractKeywords } from './text-analyzer.js';
+import { CROSS_LOBE_WEAK_SCORE_PENALTY, CROSS_LOBE_MIN_MATCH_RATIO } from './thresholds.js';
 
 // --- Server health state ---
 // Tracks the degradation ladder: Running -> Degraded -> SafeMode
@@ -151,10 +154,9 @@ function resolveToolContext(rawLobe: string | undefined, opts?: { isGlobal?: boo
     const configOrigin = configManager.getConfigOrigin();
     let hint = '';
     if (configOrigin.source === 'file') {
-      hint = `\n\nTo add lobe "${lobe}":\n` +
-             `1. Edit ${configOrigin.path}\n` +
-             `2. Add: "${lobe}": { "root": "$HOME/git/.../repo", "memoryDir": ".memory", "budgetMB": 2 }\n` +
-             `3. Restart the memory MCP server`;
+      hint = `\n\nTo add lobe "${lobe}", either:\n` +
+             `A) Call memory_bootstrap(lobe: "${lobe}", root: "/absolute/path/to/repo") — auto-adds it in one step.\n` +
+             `B) Edit ${configOrigin.path}, add: "${lobe}": { "root": "/absolute/path/to/repo", "budgetMB": 2 }, then retry (no restart needed — the server hot-reloads automatically).`;
     } else if (configOrigin.source === 'env') {
       hint = `\n\nTo add lobe "${lobe}", update MEMORY_MCP_WORKSPACES env var or create memory-config.json`;
     } else {
@@ -205,15 +207,18 @@ const server = new Server(
   { capabilities: { tools: {} } }
 );
 
-// Shared lobe property for tool schemas
-const isSingleLobe = lobeNames.length === 1;
-const lobeProperty = {
-  type: 'string' as const,
-  description: isSingleLobe
-    ? `Memory lobe name (defaults to "${lobeNames[0]}" if omitted)`
-    : `Memory lobe name. Optional for reads (query/context/briefing/stats search all lobes when omitted). Required for writes (store/correct/bootstrap). Available: ${lobeNames.join(', ')}`,
-  enum: lobeNames.length > 1 ? lobeNames : undefined,
-};
+/** Build the shared lobe property for tool schemas — called on each ListTools request
+ *  so the description and enum stay in sync after a hot-reload adds or removes lobes. */
+function buildLobeProperty(currentLobeNames: readonly string[]) {
+  const isSingle = currentLobeNames.length === 1;
+  return {
+    type: 'string' as const,
+    description: isSingle
+      ? `Memory lobe name (defaults to "${currentLobeNames[0]}" if omitted)`
+      : `Memory lobe name. Optional for reads (query/context/briefing/stats search all lobes when omitted). Required for writes (store/correct/bootstrap). Available: ${currentLobeNames.join(', ')}`,
+    enum: currentLobeNames.length > 1 ? [...currentLobeNames] : undefined,
+  };
+}
 
 /** Helper to format config file path for display */
 function configFileDisplay(): string {
@@ -222,8 +227,14 @@ function configFileDisplay(): string {
 }
 
 // --- Tool definitions ---
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
+// Handler is async so it can call configManager.ensureFresh() and return a fresh
+// lobe list. This ensures the enum and descriptions stay correct after hot-reload.
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  await configManager.ensureFresh();
+  const currentLobeNames = configManager.getLobeNames();
+  const lobeProperty = buildLobeProperty(currentLobeNames);
+
+  return { tools: [
     // memory_list_lobes is hidden — lobe info is surfaced in memory_context() hints
     // and memory_stats. The handler still works if called directly.
     {
@@ -235,7 +246,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           lobe: lobeProperty,
           topic: {
             type: 'string',
-            description: 'user | preferences | architecture | conventions | gotchas | recent-work | modules/<name>',
+            // modules/<name> is intentionally excluded from the enum so the MCP schema
+            // doesn't restrict it — agents can pass any "modules/foo" value and it works.
+            // The description makes this explicit.
+            description: 'Predefined: user | preferences | architecture | conventions | gotchas | recent-work. Custom namespace: modules/<name> (e.g. modules/brainstorm, modules/game-design, modules/api-notes). Use modules/<name> for any domain that doesn\'t fit the built-in topics.',
             enum: ['user', 'preferences', 'architecture', 'conventions', 'gotchas', 'recent-work'],
           },
           title: {
@@ -351,11 +365,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     // hints when storage is running low. The handler still works if called directly.
     {
       name: 'memory_bootstrap',
-      description: 'First-time setup: scan repo structure, README, and build system to seed initial knowledge. Run once per new codebase.',
+      description: 'First-time setup: scan repo structure, README, and build system to seed initial knowledge. Run once per new codebase. If the lobe does not exist yet, provide "root" to auto-add it to memory-config.json and proceed without a manual restart.',
       inputSchema: {
         type: 'object' as const,
         properties: {
-          lobe: lobeProperty,
+          lobe: {
+            type: 'string' as const,
+            // No enum restriction: agents pass new lobe names not yet in the config
+            description: `Memory lobe name. If the lobe doesn't exist yet, also pass "root" to auto-create it. Available lobes: ${currentLobeNames.join(', ')}`,
+          },
+          root: {
+            type: 'string' as const,
+            description: 'Absolute path to the repo root. Required only when the lobe does not exist yet — the server will add it to memory-config.json automatically.',
+          },
+          budgetMB: {
+            type: 'number' as const,
+            description: 'Storage budget in MB for the new lobe (default: 2). Only used when auto-creating a lobe via "root".',
+          },
         },
         required: [],
       },
@@ -363,8 +389,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     // memory_diagnose is intentionally hidden from the tool list — it clutters
     // agent tool discovery and should only be called when directed by error messages
     // or crash reports. The handler still works if called directly.
-  ],
-}));
+  ] };
+});
 
 // --- Tool handlers ---
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -644,7 +670,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Nudge: when searching all lobes, remind the agent to specify one for targeted results
         const allQueryLobeNames = configManager.getLobeNames();
         if (!rawLobe && !isGlobalQuery && allQueryLobeNames.length > 1) {
-          hints.push(`Searched all lobes. For targeted results use lobe: "${allQueryLobeNames[0]}" (available: ${allQueryLobeNames.join(', ')}).`);
+          hints.push(`Searched all lobes (${allQueryLobeNames.join(', ')}). Specify lobe: "<name>" for targeted results.`);
         }
 
         if (detail !== 'full') {
@@ -836,6 +862,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
+        // Cross-lobe weak-match penalty: demote results from other repos that only matched
+        // on generic software terms (e.g. "codebase", "structure"). Without this, a high-
+        // confidence entry from an unrelated repo can outrank genuinely relevant knowledge
+        // simply because popular terms appear in it.
+        // Applied only in multi-lobe mode; single-lobe and global results are never penalized.
+        if (isCtxMultiLobe) {
+          const contextKwCount = extractKeywords(context).size;
+          // Minimum keyword matches required to avoid the penalty (at least 40% of context, min 2)
+          const minMatchCount = Math.max(2, Math.ceil(contextKwCount * CROSS_LOBE_MIN_MATCH_RATIO));
+          for (let i = 0; i < allLobeResults.length; i++) {
+            if (allLobeResults[i].matchedKeywords.length < minMatchCount) {
+              allLobeResults[i] = { ...allLobeResults[i], score: allLobeResults[i].score * CROSS_LOBE_WEAK_SCORE_PENALTY };
+            }
+          }
+        }
+
         // Always include global store (user + preferences)
         const globalResults = await globalStore.contextSearch(context, max, undefined, threshold);
         for (const r of globalResults) ctxEntryLobeMap.set(r.entry.id, 'global');
@@ -914,10 +956,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Hints
         const ctxHints: string[] = [];
 
-        // Nudge: when searching all lobes, remind the agent to specify one for targeted results
+        // Nudge: when searching all lobes, infer the most relevant lobe from context keywords
+        // matching lobe names (e.g. "minion-miner" in context → suggest lobe "minion-miner"),
+        // falling back to the first lobe when no name overlap is found.
         const allCtxLobeNames = configManager.getLobeNames();
         if (!rawLobe && allCtxLobeNames.length > 1) {
-          ctxHints.push(`Searched all lobes. For faster, targeted results use lobe: "${allCtxLobeNames[0]}" (available: ${allCtxLobeNames.join(', ')}).`);
+          const contextKws = extractKeywords(context);
+          const inferredLobe = allCtxLobeNames.find(name =>
+            [...extractKeywords(name)].some(kw => contextKws.has(kw))
+          ) ?? allCtxLobeNames[0];
+          ctxHints.push(`Searched all lobes. For faster, targeted results use lobe: "${inferredLobe}" (available: ${allCtxLobeNames.join(', ')}).`);
         }
 
         if (results.length >= max) {
@@ -974,9 +1022,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'memory_bootstrap': {
-        const { lobe: rawLobe } = z.object({
+        const { lobe: rawLobe, root, budgetMB } = z.object({
           lobe: z.string().optional(),
+          root: z.string().optional(),
+          budgetMB: z.number().positive().optional(),
         }).parse(args);
+
+        // Auto-create lobe: if the lobe is unknown AND root is provided AND config is
+        // file-based, write the new lobe entry into memory-config.json and hot-reload.
+        // This lets the agent bootstrap a brand-new repo in a single tool call.
+        if (rawLobe && root && !configManager.getStore(rawLobe)) {
+          const origin = configManager.getConfigOrigin();
+          if (origin.source !== 'file') {
+            return {
+              content: [{
+                type: 'text',
+                text: `Cannot auto-add lobe "${rawLobe}": config is not file-based (source: ${origin.source}).\n\n` +
+                  `Create memory-config.json next to the memory MCP server with a "lobes" block, then retry.`,
+              }],
+              isError: true,
+            };
+          }
+
+          try {
+            const raw = await readFile(origin.path, 'utf-8');
+            const config = JSON.parse(raw) as { lobes?: Record<string, unknown> };
+            if (!config.lobes || typeof config.lobes !== 'object') config.lobes = {};
+            config.lobes[rawLobe] = { root, budgetMB: budgetMB ?? 2 };
+            await writeFile(origin.path, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+            process.stderr.write(`[memory-mcp] Auto-added lobe "${rawLobe}" (root: ${root}) to memory-config.json\n`);
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            return {
+              content: [{ type: 'text', text: `Failed to auto-add lobe "${rawLobe}" to memory-config.json: ${message}` }],
+              isError: true,
+            };
+          }
+
+          // Reload config to pick up the new lobe (hot-reload detects the updated mtime)
+          await configManager.ensureFresh();
+        }
 
         // Resolve store — after this point, rawLobe is never used again
         const ctx = resolveToolContext(rawLobe);
@@ -1025,7 +1110,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const lobeNames = configManager.getLobeNames();
       hint = `\n\nHint: lobe is required. Use memory_list_lobes to see available lobes. Available: ${lobeNames.join(', ')}`;
     } else if (message.includes('"topic"') || message.includes('"title"') || message.includes('"content"')) {
-      hint = '\n\nHint: memory_store requires: lobe, topic (architecture|conventions|gotchas|recent-work), title, content';
+      hint = '\n\nHint: memory_store requires: topic (architecture|conventions|gotchas|recent-work|modules/<name>), title, content. Use modules/<name> for custom namespaces (e.g. modules/brainstorm, modules/game-design).';
     } else if (message.includes('"scope"')) {
       hint = '\n\nHint: memory_query requires: lobe, scope (architecture|conventions|gotchas|recent-work|modules/<name>|* for all)';
     }
