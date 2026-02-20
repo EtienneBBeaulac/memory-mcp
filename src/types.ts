@@ -54,7 +54,8 @@ export interface MemoryEntry {
   readonly content: string;
   readonly confidence: number;       // 0.0 - 1.0
   readonly trust: TrustLevel;
-  readonly sources: readonly string[]; // file paths that informed this
+  readonly sources: readonly string[]; // file paths that informed this (provenance)
+  readonly references?: readonly string[]; // semantic pointers — files/classes this entry is about
   readonly created: string;           // ISO 8601
   readonly lastAccessed: string;      // ISO 8601
   readonly gitSha?: string;           // SHA of source files at write time
@@ -92,6 +93,8 @@ export interface QueryEntry {
   readonly confidence: number;
   readonly relevanceScore: number;   // title-weighted relevance when filtered, else confidence
   readonly fresh: boolean;
+  // In 'standard' and 'full' detail
+  readonly references?: readonly string[];
   // Only in 'full' detail
   readonly content?: string;
   readonly trust?: TrustLevel;
@@ -120,6 +123,8 @@ export type StoreResult =
       readonly file: string;
       readonly confidence: number;
       readonly warning?: string;
+      /** Soft warning when content looks ephemeral — informational, never blocking */
+      readonly ephemeralWarning?: string;
       readonly relatedEntries?: readonly RelatedEntry[];
       readonly relevantPreferences?: readonly RelatedEntry[];
     }
@@ -158,11 +163,27 @@ export interface MemoryStats {
   readonly newestEntry?: string;
 }
 
+/** A stale entry surfaced during briefing for agent-driven renewal */
+export interface StaleEntry {
+  readonly id: string;
+  readonly title: string;
+  readonly topic: TopicScope;
+  readonly daysSinceAccess: number;
+}
+
+/** A pair of entries with high content overlap — potential conflict */
+export interface ConflictPair {
+  readonly a: { readonly id: string; readonly title: string; readonly confidence: number; readonly created: string };
+  readonly b: { readonly id: string; readonly title: string; readonly confidence: number; readonly created: string };
+  readonly similarity: number;
+}
+
 /** Briefing response for session start */
 export interface BriefingResult {
   readonly briefing: string;
   readonly entryCount: number;
   readonly staleEntries: number;
+  readonly staleDetails?: readonly StaleEntry[]; // structured stale data for index.ts to format
   readonly suggestion?: string;
 }
 
@@ -172,11 +193,29 @@ export interface GitService {
   getHeadSha(repoRoot: string): Promise<string | undefined>;
 }
 
+/** User-configurable behavior thresholds — exposed via memory-config.json "behavior" block.
+ *  All fields are optional; the system uses the defaults from thresholds.ts when absent. */
+export interface BehaviorConfig {
+  /** Days since lastAccessed before a standard entry (arch, conv, gotchas, etc.) goes stale.
+   *  Lower for fast-moving codebases; higher for stable ones. Default: 30. Range: 1–365. */
+  readonly staleDaysStandard?: number;
+  /** Days since lastAccessed before a preferences entry goes stale.
+   *  Preferences evolve slowly — default 90 keeps them fresh longer. Range: 1–730. */
+  readonly staleDaysPreferences?: number;
+  /** Maximum stale entries shown in a briefing. Default: 5. Range: 1–20. */
+  readonly maxStaleInBriefing?: number;
+  /** Maximum dedup suggestions when storing a new entry. Default: 3. Range: 1–10. */
+  readonly maxDedupSuggestions?: number;
+  /** Maximum conflict pairs shown per query/context response. Default: 2. Range: 1–5. */
+  readonly maxConflictPairs?: number;
+}
+
 /** Configuration for the memory MCP */
 export interface MemoryConfig {
   readonly repoRoot: string;          // path to the target repository
   readonly memoryPath: string;        // absolute path to the memory storage directory
   readonly storageBudgetBytes: number; // default: 2MB
+  readonly behavior?: BehaviorConfig; // user-facing behavior thresholds
   readonly clock?: Clock;             // injectable clock for testing; defaults to realClock
   readonly git?: GitService;          // injectable git service; defaults to realGitService
 }

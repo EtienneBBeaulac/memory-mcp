@@ -1,13 +1,43 @@
 # Memory MCP Roadmap
 
-## Current State (v0.1.0)
+## Current State (v0.1.1)
 
-Flat topic-based store with one-file-per-entry. 8 tools, 63 tests passing.
+Flat topic-based store with one-file-per-entry. 12 tools + 3 MCP resources, 332 tests.
 Shared across worktrees via `.git/memory/`, branch-scoped recent-work.
 Topics: user, preferences, architecture, conventions, gotchas, recent-work, modules/*.
 Dedup via hybrid Jaccard+containment with naive stemming. Preference surfacing
 on store. `memory_context` for keyword-based contextual search with topic boosting.
 Piggyback hints on correct/store responses.
+
+### Recent additions (this session)
+- **`references` field**: optional file/class paths on entries, persisted to disk,
+  1.3x context search boost when reference basename matches context keywords.
+- **Tiered staleness**: user=always fresh, preferences=90 days, everything else=30 days.
+  Trust level no longer exempts from staleness. Briefing surfaces top 5 stale entries
+  with structured `StaleEntry` data and actionable `memory_correct` instructions.
+- **Conflict detection**: cross-topic similarity check (>60%) on query/context results.
+  Surfaces top 2 conflict pairs with consolidation guidance.
+- **MCP Resources**: `memory://lobes`, `memory://stats`, `memory://diagnostics`.
+  Old tools (`memory_list_lobes`, `memory_stats`, `memory_diagnose`) kept as
+  deprecated aliases. Shared builder functions (`buildLobeInfo`, `buildDiagnosticsText`).
+- **`src/thresholds.ts`**: central named constants for all magic numbers. Internal
+  algorithm thresholds (dedup, conflict, boost) separate from user-facing behavior
+  defaults (stale days, max stale in briefing, max dedup/conflict caps).
+- **`BehaviorConfig`**: user-configurable via `memory-config.json` `"behavior"` block.
+  `parseBehaviorConfig()` validates ranges, warns on unknown keys (typo detection).
+  Active config surfaced in `memory_diagnose` / `memory://diagnostics`.
+- **Ephemeral content detection**: declarative signal registry in `src/ephemeral.ts`.
+  13 regex signals: temporal, fixed-bug, task-language, stack-trace, environment-specific,
+  verbatim-code, investigation, uncertainty, self-correction, meeting-reference,
+  pending-decision, version-pinned, metrics-change. Soft warnings only (never blocking).
+  `recent-work` topic bypasses detection (ephemeral by design).
+- **TF-IDF ephemeral classifier**: logistic regression over TF-IDF features trained on
+  415 labeled cases (6 tech stacks: Python/Django, React/TypeScript, DevOps/infra,
+  iOS/Swift, data engineering, Rust systems). Ships as `ephemeral-weights.json` (12KB).
+  Fires as supplementary signal when regex misses (confidence: low). Combined benchmark:
+  100% precision, 67.8% recall, 83.4% accuracy on 415 adversarial cases.
+- **Context dedup hint**: `memory_context` responses include loaded keywords and topics
+  to discourage redundant context calls within the same session.
 
 ## v1.1 — Quality of Life
 
@@ -67,6 +97,61 @@ When `memory_correct` is called with replace/append, analyze the correction.
 If it looks like a generalizable rule (not a typo fix), auto-store as a
 preference with `trust: agent-inferred` and let the user confirm.
 
+## v1.2 — Signal Intelligence & Data Collection
+
+### Ephemeral Signal Instrumentation (priority)
+Record which ephemeral signal IDs fired at store time by persisting them in the
+`MemoryEntry` as `ephemeralSignals?: string[]` (also written to disk as a metadata
+line). Then at delete time, classify the outcome:
+- Entry deleted within 24h with signals → **true positive** (signal was right)
+- Entry deleted within 24h without signals → **false negative** (missed ephemeral)
+- Entry survives 30+ days with signals → **false positive** (overly cautious)
+- Entry survives 30+ days without signals → **true negative** (correct durable)
+
+Log classification events to stderr. Over time this produces a confusion matrix
+that tells us: which signals have high FP rates (tighten), which entries get
+deleted quickly without any signal (add new patterns), and whether ML is needed.
+
+~15 lines in store.ts (persist signals), ~10 lines in correct/delete path (classify),
+~5 lines in types.ts. No external dependencies.
+
+This is the prerequisite for any future ML: it generates labeled training data
+passively from normal usage.
+
+### Synonym & Acronym Maps for Dedup
+Lightweight dictionary approach before jumping to embeddings:
+- Synonym pairs: error↔exception, function↔method, class↔type, mock↔fake
+- Acronym expansion: DI→dependency-injection, MVI→model-view-intent, VM→viewmodel
+- Language equivalents: sealed-class↔enum-with-associated-values
+Applied during keyword extraction in `text-analyzer.ts`. Improves dedup and
+conflict detection without any ML dependency.
+
+### Ephemeral Signal: Version/Date References
+New signal for content containing version numbers or dates that will become stale:
+- "React Router v5", "Gradle 8.2", "API v3"
+- "As of February 2026", "since the Q4 release"
+These are inherently time-bound facts. Medium confidence.
+
+### Ephemeral Signal: Negation Without Alternative
+Content that says what NOT to do without explaining the preferred approach:
+- "Don't use GlobalScope" (but what should you use instead?)
+- "Avoid MutableStateFlow" (but what's the alternative?)
+Useful as a quality nudge: "Consider adding the recommended alternative."
+
+### Contextual Ephemeral Thresholds
+Some topics should have different ephemeral sensitivity:
+- `gotchas` → higher sensitivity (gotchas about fixed bugs are the worst)
+- `architecture` → lower sensitivity (architecture discussions naturally use
+  hedging language like "we think X is the right approach")
+- `user` → skip entirely (identity never ephemeral)
+Configurable via `BehaviorConfig` or per-signal `skipTopics` in the registry.
+
+### Store-Time Content Quality Scoring
+Combine ephemeral signals, content length, reference count, and specificity
+into a single quality score (0-1) returned in `StoreResult`. Not blocking —
+just informational. Helps agents self-correct: "This entry scored 0.3/1.0
+for long-term value. Consider adding more context or references."
+
 ## v2.0 — Knowledge Graph
 
 Full design in `codebase-memory-mcp-design-thinking.md` (V2 section).
@@ -103,12 +188,62 @@ keyword overlap becomes `related_to` edges with Jaccard-based weights.
 
 ## v3.0 — Semantic Layer
 
-### Embedding-Based Search
-Replace keyword extraction with lightweight local embeddings for `memory_context`.
-Required if knowledge base grows beyond ~500 entries where keyword matching breaks down.
-Candidate models: all-MiniLM-L6-v2 (fast, 384-dim), or gte-small (better quality).
-Store embeddings alongside entries in a `.embeddings.json` sidecar file.
-Query = embed context string, cosine similarity against all entries, top-N.
+### Embedding Service — Async, Optional, Additive
+
+**Architecture**: a single embedding model serving multiple purposes (conflict detection,
+dedup, context search reranking). Runs async after store returns — zero blocking latency.
+Results surface on the next query/context/briefing call.
+
+**Key design principles:**
+1. **Purely additive**: removing the embedding model changes nothing — system falls back
+   to keyword matching silently. No feature depends on embeddings being available.
+2. **Async embedding**: `store()` returns immediately; background task embeds the entry
+   and writes a `.vec` sidecar file alongside the `.md` entry.
+3. **Pre-cached vectors**: at query/context/briefing time, embeddings are already cached
+   from store-time. Cosine similarity between cached vectors is <1ms.
+4. **Optional peer dependency**: `@huggingface/transformers` (ONNX runtime in Node.js).
+   Users who want it: `npm install @huggingface/transformers`. Everyone else: zero change.
+
+**Implementation plan:**
+- `src/embeddings.ts`: lazy model loader, `embed()`, `batchEmbed()`, `cosineSimilarity()`
+- `src/embedding-cache.ts`: read/write `.vec` files (float32, ~1.5KB each for 384-dim),
+  in-memory cache (~300KB for 200 entries)
+- Background task queue: simple `setTimeout`-based, processes entries after store returns
+- Content hash stored alongside `.vec` for model version drift detection
+- Atomic writes: `.vec.tmp` → rename to prevent corruption on process kill
+
+**Integration points:**
+- `detectConflicts()`: replaces keyword Jaccard with cosine similarity (primary win)
+- `findRelatedEntries()`: same — catches synonym-level dedup
+- `contextSearch()`: supplementary ranking signal when vectors are pre-cached
+- `memory-config.json`: `{ "behavior": { "embeddingModel": "all-MiniLM-L6-v2" } }`
+
+**Crash safety:**
+- Partially written `.vec` files: atomic rename prevents corruption
+- Queued but unprocessed entries: startup scan detects entries without `.vec`, re-queues
+- Model download timeout: first session may lack embeddings; keyword fallback covers it
+
+**When to build**: when knowledge bases regularly exceed ~200 entries and keyword-based
+conflict detection produces noticeable false negatives in real usage.
+
+Candidate models: all-MiniLM-L6-v2 (~23MB, 384-dim, fast), gte-small (better quality).
+
+### ML-Based Ephemeral Classifier — Status: Shipped (TF-IDF)
+
+**Shipped**: TF-IDF + logistic regression classifier (`ephemeral-weights.json`, 12KB).
+Trained on 415 labeled cases across 6 tech stacks. 5-fold cross-validation:
+precision=81.3%, recall=88.4%, F1=84.7%. Combined with regex signals:
+100% precision, 67.8% recall on the full adversarial benchmark.
+
+**Future upgrade path** (if needed):
+- Option A: retrain with more data from ephemeral signal instrumentation (v1.2)
+- Option B: zero-shot NLI model (DistilBERT-MNLI) via the embedding service infra
+  — would catch hedging/uncertainty that TF-IDF misses, but adds model dependency
+- Option C: fine-tuned classifier head on the embedding model
+  — highest quality, but requires training infrastructure
+
+**When to upgrade**: when the combined regex+TF-IDF approach drops below 60% recall
+on real-world content, or when the embedding service is already deployed (piggyback).
 
 ### Passive Learning
 Track which files the agent reads/edits across sessions. Infer hot modules, usage patterns.

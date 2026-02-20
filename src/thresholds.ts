@@ -1,0 +1,70 @@
+// Central threshold definitions for the memory MCP.
+//
+// Split into two categories intentionally:
+//
+//   INTERNAL — calibrated against the text-analyzer algorithm (Jaccard + containment hybrid).
+//   Changing these without understanding the similarity function produces confusing results.
+//   Not exposed to users.
+//
+//   USER-FACING — control how the system behaves for the user's workflow.
+//   Exposed via memory-config.json under a top-level "behavior" key.
+//   All have sensible defaults; the user only needs to set what they want to change.
+
+// ─── Internal algorithm thresholds ─────────────────────────────────────────
+// These are properties of the similarity function, not user preferences.
+
+/** Minimum similarity score for dedup detection at write time (same-topic). */
+export const DEDUP_SIMILARITY_THRESHOLD = 0.35;
+
+/** Minimum similarity score for conflict detection at query time (cross-topic). */
+export const CONFLICT_SIMILARITY_THRESHOLD = 0.60;
+
+/** Minimum similarity score for surfacing relevant preferences (cross-topic). */
+export const PREFERENCE_SURFACE_THRESHOLD = 0.20;
+
+/** Minimum content length (chars) for conflict detection — short entries are too noisy. */
+export const CONFLICT_MIN_CONTENT_CHARS = 50;
+
+/** Score multiplier when a reference path basename matches the context keywords. */
+export const REFERENCE_BOOST_MULTIPLIER = 1.30;
+
+/** Per-topic scoring boost factors for contextSearch().
+ *  Higher = more likely to surface for any given context. */
+export const TOPIC_BOOST: Record<string, number> = {
+  user: 2.0,          // always surface identity
+  preferences: 1.8,   // almost always relevant
+  gotchas: 1.5,       // high-value warnings
+  conventions: 1.2,   // coding patterns
+  architecture: 1.0,  // baseline
+  'recent-work': 0.9, // slightly deprioritized (branch-filtered separately)
+};
+
+/** Boost for module-scoped topics not in TOPIC_BOOST. */
+export const MODULE_TOPIC_BOOST = 1.1;
+
+/** User entry score when included by default (no keyword match). */
+export const USER_ALWAYS_INCLUDE_SCORE_FRACTION = 0.5;
+
+// ─── User-facing behavior defaults ─────────────────────────────────────────
+// These are exposed via memory-config.json "behavior" block.
+// All values below are the defaults used when the user has not configured them.
+
+/** Days since lastAccessed before a standard entry (arch, conv, gotchas, etc.) goes stale. */
+export const DEFAULT_STALE_DAYS_STANDARD = 30;
+
+/** Days since lastAccessed before a preferences entry goes stale.
+ *  Longer than standard because coding preferences evolve slowly. */
+export const DEFAULT_STALE_DAYS_PREFERENCES = 90;
+
+/** Maximum stale entries surfaced in a single briefing.
+ *  Keeps the briefing actionable without overwhelming the agent. */
+export const DEFAULT_MAX_STALE_IN_BRIEFING = 5;
+
+/** Maximum dedup suggestions returned when storing a new entry. */
+export const DEFAULT_MAX_DEDUP_SUGGESTIONS = 3;
+
+/** Maximum conflict pairs surfaced per query/context response. */
+export const DEFAULT_MAX_CONFLICT_PAIRS = 2;
+
+/** Maximum related preferences surfaced when storing a non-preference entry. */
+export const DEFAULT_MAX_PREFERENCE_SUGGESTIONS = 3;

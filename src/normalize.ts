@@ -12,6 +12,7 @@ const PARAM_ALIASES: Record<string, string> = {
   value: 'content',
   body: 'content',
   text: 'content',
+  refs: 'references',
   // memory_query aliases
   query: 'filter',
   search: 'filter',

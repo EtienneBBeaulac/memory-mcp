@@ -644,4 +644,244 @@ describe('E2E: MCP Server', () => {
       assert.ok(queryText.includes('StreamCoordinator'), 'Should find module entry content');
     });
   });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Feature 1: references field (e2e)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  describe('references field (e2e)', () => {
+    it('stores and queries references via tool call', async () => {
+      const storeResp = await client.callTool('memory_store', {
+        topic: 'architecture',
+        title: 'Messaging Reducer Architecture',
+        content: 'The messaging feature uses a standalone reducer pattern with sealed interface events',
+        references: ['features/messaging/impl/MessagingReducer.kt', 'features/messaging/api/MessagingEvent.kt'],
+        trust: 'agent-confirmed',
+      });
+      assert.ok(!client.isError(storeResp), `Store with references should succeed: ${client.getText(storeResp)}`);
+      const storeText = client.getText(storeResp);
+      assert.ok(storeText.includes('Stored entry'), 'Should confirm storage');
+
+      // Query back with full detail — references should appear
+      const queryResp = await client.callTool('memory_query', {
+        scope: 'architecture',
+        detail: 'full',
+        filter: 'Messaging Reducer Architecture',
+      });
+      assert.ok(!client.isError(queryResp));
+      const queryText = client.getText(queryResp);
+      assert.ok(queryText.includes('MessagingReducer.kt'), 'References should appear in full detail response');
+      assert.ok(queryText.includes('MessagingEvent.kt'), 'All references should appear');
+
+      // Extract ID and clean up
+      const idMatch = storeText.match(/(arch-[0-9a-f]+)/);
+      if (idMatch) {
+        await client.callTool('memory_correct', { id: idMatch[1], action: 'delete' });
+      }
+    });
+
+    it('accepts refs alias for references', async () => {
+      const storeResp = await client.callTool('memory_store', {
+        topic: 'conventions',
+        title: 'Refs Alias Test',
+        content: 'Testing that refs is accepted as an alias for references field in tool calls',
+        refs: ['src/SomeClass.kt'],
+      });
+      assert.ok(!client.isError(storeResp), `Store with refs alias should succeed: ${client.getText(storeResp)}`);
+
+      // Query back with full detail
+      const queryResp = await client.callTool('memory_query', {
+        scope: 'conventions',
+        detail: 'full',
+        filter: 'Refs Alias Test',
+      });
+      const queryText = client.getText(queryResp);
+      assert.ok(queryText.includes('SomeClass.kt'), 'refs alias should be normalized to references');
+
+      // Clean up
+      const storeText = client.getText(storeResp);
+      const idMatch = storeText.match(/(conv-[0-9a-f]+)/);
+      if (idMatch) {
+        await client.callTool('memory_correct', { id: idMatch[1], action: 'delete' });
+      }
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Feature 2: Stale entry nudges in briefing (e2e)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  describe('stale entry touch via memory_correct (e2e)', () => {
+    it('refreshes lastAccessed when correcting with empty append', async () => {
+      // Store an entry
+      const storeResp = await client.callTool('memory_store', {
+        topic: 'architecture',
+        title: 'Touchable Entry',
+        content: 'Architecture pattern to verify timestamp refresh via empty append',
+        trust: 'agent-inferred',
+      });
+      assert.ok(!client.isError(storeResp));
+      const storeText = client.getText(storeResp);
+      const idMatch = storeText.match(/(arch-[0-9a-f]+)/);
+      assert.ok(idMatch, 'Should get an entry ID');
+      const entryId = idMatch![1];
+
+      // Touch the entry with an empty append — this refreshes lastAccessed
+      const touchResp = await client.callTool('memory_correct', {
+        id: entryId,
+        action: 'append',
+        correction: '',
+      });
+      assert.ok(!client.isError(touchResp), `Empty append should succeed: ${client.getText(touchResp)}`);
+      assert.ok(client.getText(touchResp).includes('Corrected entry'), 'Should confirm the correction');
+
+      // Query back — entry should still exist with original content structure
+      const queryResp = await client.callTool('memory_query', {
+        scope: 'architecture',
+        detail: 'full',
+        filter: 'Touchable Entry',
+      });
+      assert.ok(!client.isError(queryResp));
+      assert.ok(client.getText(queryResp).includes('Architecture pattern'), 'Content should persist after touch');
+
+      // Clean up
+      await client.callTool('memory_correct', { id: entryId, action: 'delete' });
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Feature 3: Conflict detection (e2e)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  describe('conflict detection (e2e)', () => {
+    it('surfaces conflict warning when querying highly similar entries', async () => {
+      const longShared = 'This codebase uses MVI architecture pattern with standalone reducer classes sealed interface events ViewModels as orchestrators and coroutines for async operations';
+
+      const r1 = await client.callTool('memory_store', {
+        topic: 'architecture',
+        title: 'MVI Architecture Overview',
+        content: longShared,
+        trust: 'user',
+      });
+      const r2 = await client.callTool('memory_store', {
+        topic: 'conventions',
+        title: 'Architecture Conventions',
+        content: longShared + ' following clean architecture principles',
+        trust: 'user',
+      });
+      assert.ok(!client.isError(r1) && !client.isError(r2), 'Both stores should succeed');
+
+      // Query with wildcard — should detect the conflict cross-topic
+      const queryResp = await client.callTool('memory_query', {
+        scope: '*',
+        detail: 'full',
+        filter: 'MVI architecture reducer',
+      });
+      const queryText = client.getText(queryResp);
+      assert.ok(queryText.includes('⚠') || queryText.includes('Potential conflicts'), 'Should surface conflict warning for highly similar entries');
+
+      // Clean up
+      const t1 = client.getText(r1).match(/(arch-[0-9a-f]+)/);
+      const t2 = client.getText(r2).match(/(conv-[0-9a-f]+)/);
+      if (t1) await client.callTool('memory_correct', { id: t1[1], action: 'delete' });
+      if (t2) await client.callTool('memory_correct', { id: t2[1], action: 'delete' });
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Operational tools and diagnostics (e2e)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  describe('operational tools (e2e)', () => {
+    it('memory_list_lobes returns lobe info', async () => {
+      const resp = await client.callTool('memory_list_lobes');
+      assert.ok(!client.isError(resp), 'memory_list_lobes should work');
+      const data = JSON.parse(client.getText(resp));
+      assert.ok(data.lobes, 'Should have lobes array');
+      assert.ok(data.serverMode, 'Should have serverMode');
+    });
+
+    it('memory_stats returns stats', async () => {
+      const resp = await client.callTool('memory_stats');
+      assert.ok(!client.isError(resp), 'memory_stats should work');
+      assert.ok(client.getText(resp).includes('Memory Stats'), 'Should contain stats header');
+    });
+
+    it('memory_diagnose returns diagnostics', async () => {
+      const resp = await client.callTool('memory_diagnose');
+      assert.ok(!client.isError(resp), 'memory_diagnose should work');
+      assert.ok(client.getText(resp).includes('Diagnostics'), 'Should contain diagnostics header');
+    });
+
+    it('memory_diagnose surfaces active behavior config section', async () => {
+      const resp = await client.callTool('memory_diagnose');
+      assert.ok(!client.isError(resp), `memory_diagnose should succeed: ${client.getText(resp)}`);
+      const text = client.getText(resp);
+
+      // Behavior config section should always be present in diagnostics
+      assert.ok(text.includes('Active Behavior Config'), 'Should include behavior config section header');
+      assert.ok(text.includes('staleDaysStandard'), 'Should show staleDaysStandard');
+      assert.ok(text.includes('staleDaysPreferences'), 'Should show staleDaysPreferences');
+      assert.ok(text.includes('maxStaleInBriefing'), 'Should show maxStaleInBriefing');
+
+      // In tests there is no memory-config.json, so all values should be defaults
+      assert.ok(text.includes('(default)'), 'Should mark values as default when no behavior override is set');
+      assert.ok(text.includes('memory-config.json'), 'Should hint how to customize');
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Ephemeral content detection (e2e)
+  // ────────────────────────────────────────────────────────────────────────
+
+  describe('ephemeral content detection (e2e)', () => {
+    it('surfaces ephemeral warning for temporal content via tool call', async () => {
+      const resp = await client.callTool('memory_store', {
+        topic: 'gotchas',
+        title: 'Ephemeral Test Entry',
+        content: 'The build is currently broken and we are investigating the root cause right now',
+        trust: 'agent-inferred',
+      });
+      assert.ok(!client.isError(resp), `Store should succeed: ${client.getText(resp)}`);
+      const text = client.getText(resp);
+      assert.ok(text.includes('Stored entry'), 'Entry should be stored (soft warning, not blocked)');
+      assert.ok(text.includes('⏳'), 'Should include ephemeral warning marker');
+      assert.ok(text.includes('ephemeral'), 'Should mention ephemeral content');
+
+      // Clean up
+      const idMatch = text.match(/(gotcha-[0-9a-f]+)/);
+      if (idMatch) await client.callTool('memory_correct', { id: idMatch[1], action: 'delete' });
+    });
+
+    it('surfaces ephemeral warning for fixed-bug content', async () => {
+      const resp = await client.callTool('memory_store', {
+        topic: 'gotchas',
+        title: 'Fixed Bug Entry',
+        content: 'The crash bug in messaging has been resolved by updating the dependency injection scope',
+        trust: 'agent-confirmed',
+      });
+      assert.ok(!client.isError(resp));
+      const text = client.getText(resp);
+      assert.ok(text.includes('⏳'), 'Should include ephemeral warning for fixed bugs');
+      assert.ok(text.includes('Resolved issue') || text.includes('resolved'), 'Should flag resolved issues');
+
+      const idMatch = text.match(/(gotcha-[0-9a-f]+)/);
+      if (idMatch) await client.callTool('memory_correct', { id: idMatch[1], action: 'delete' });
+    });
+
+    it('does not surface ephemeral warning for durable content', async () => {
+      const resp = await client.callTool('memory_store', {
+        topic: 'architecture',
+        title: 'Durable Architecture Entry',
+        content: 'The messaging feature uses MVI with standalone reducer classes and sealed interface events for exhaustive handling',
+        trust: 'user',
+      });
+      assert.ok(!client.isError(resp));
+      const text = client.getText(resp);
+      assert.ok(!text.includes('⏳'), 'Durable content should not trigger ephemeral warning');
+
+      const idMatch = text.match(/(arch-[0-9a-f]+)/);
+      if (idMatch) await client.callTool('memory_correct', { id: idMatch[1], action: 'delete' });
+    });
+  });
 });

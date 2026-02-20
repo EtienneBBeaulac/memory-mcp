@@ -15,9 +15,14 @@ import path from 'path';
 import os from 'os';
 import { existsSync, writeFileSync } from 'fs';
 import { MarkdownMemoryStore } from './store.js';
-import type { DetailLevel, TopicScope, TrustLevel, MemoryStats } from './types.js';
+import type { DetailLevel, TopicScope, TrustLevel, MemoryStats, StaleEntry, ConflictPair, BehaviorConfig } from './types.js';
 import { DEFAULT_STORAGE_BUDGET_BYTES, parseTopicScope, parseTrustLevel } from './types.js';
 import { getLobeConfigs, type ConfigOrigin } from './config.js';
+import { ConfigManager } from './config-manager.js';
+import {
+  DEFAULT_STALE_DAYS_STANDARD, DEFAULT_STALE_DAYS_PREFERENCES,
+  DEFAULT_MAX_STALE_IN_BRIEFING, DEFAULT_MAX_DEDUP_SUGGESTIONS, DEFAULT_MAX_CONFLICT_PAIRS,
+} from './thresholds.js';
 import { normalizeArgs } from './normalize.js';
 import {
   buildCrashReport, writeCrashReport, writeCrashReportSync, readLatestCrash,
@@ -46,15 +51,16 @@ const serverStartTime = Date.now();
 let lastToolCall: string | undefined;
 
 // --- Configuration ---
-const { configs: lobeConfigs, origin: configOrigin } = getLobeConfigs();
+const { configs: lobeConfigs, origin: configOrigin, behavior: configBehavior } = getLobeConfigs();
+const configPath = configOrigin.source === 'file' ? configOrigin.path : '';
 
 /** Build crash context from current server state */
 function currentCrashContext(phase: CrashContext['phase']): CrashContext {
   return {
     phase,
     lastToolCall,
-    configSource: configOrigin.source,
-    lobeCount: lobeNames.length,
+    configSource: configManager.getConfigOrigin().source,
+    lobeCount: configManager.getLobeNames().length,
   };
 }
 
@@ -95,6 +101,9 @@ process.on('unhandledRejection', (reason) => {
 const stores = new Map<string, MarkdownMemoryStore>();
 const lobeNames = Array.from(lobeConfigs.keys());
 
+// ConfigManager will be initialized after stores are set up
+let configManager: ConfigManager;
+
 // Global store for user identity + preferences (shared across all lobes)
 const GLOBAL_TOPICS = new Set<string>(['user', 'preferences']);
 const globalMemoryPath = path.join(os.homedir(), '.memory-mcp', 'global');
@@ -119,6 +128,8 @@ function resolveToolContext(rawLobe: string | undefined, opts?: { isGlobal?: boo
     return { ok: true, store: globalStore, label: 'global' };
   }
 
+  const lobeNames = configManager.getLobeNames();
+
   // Default to single lobe when omitted
   const lobe = rawLobe || (lobeNames.length === 1 ? lobeNames[0] : undefined);
   if (!lobe) {
@@ -126,7 +137,7 @@ function resolveToolContext(rawLobe: string | undefined, opts?: { isGlobal?: boo
   }
 
   // Check if lobe is degraded
-  const health = lobeHealth.get(lobe);
+  const health = configManager.getLobeHealth(lobe);
   if (health?.status === 'degraded') {
     return {
       ok: false,
@@ -136,10 +147,11 @@ function resolveToolContext(rawLobe: string | undefined, opts?: { isGlobal?: boo
     };
   }
 
-  const store = stores.get(lobe);
+  const store = configManager.getStore(lobe);
   if (!store) {
     const available = lobeNames.join(', ');
 
+    const configOrigin = configManager.getConfigOrigin();
     let hint = '';
     if (configOrigin.source === 'file') {
       hint = `\n\nTo add lobe "${lobe}":\n` +
@@ -182,7 +194,8 @@ const lobeProperty = {
 
 /** Helper to format config file path for display */
 function configFileDisplay(): string {
-  return configOrigin.source === 'file' ? configOrigin.path : '(not using config file)';
+  const origin = configManager.getConfigOrigin();
+  return origin.source === 'file' ? origin.path : '(not using config file)';
 }
 
 // --- Tool definitions ---
@@ -219,7 +232,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           sources: {
             type: 'array',
             items: { type: 'string' },
-            description: 'File paths that informed this (for freshness tracking)',
+            description: 'File paths that informed this (provenance, for freshness tracking)',
+            default: [],
+          },
+          references: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Files, classes, or symbols this knowledge is about (semantic pointers). Example: ["features/messaging/impl/MessagingReducer.kt"]',
             default: [],
           },
           trust: {
@@ -398,38 +417,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   try {
+    // Ensure config is fresh before handling any tool
+    await configManager.ensureFresh();
+
     switch (name) {
       case 'memory_list_lobes': {
-        // Build lobe info array (including health status)
-        const lobeInfo = await Promise.all(
-          Array.from(lobeConfigs.entries()).map(async ([name, config]) => {
-            const health = lobeHealth.get(name) ?? { status: 'healthy' as const };
-            const store = stores.get(name);
-
-            if (health.status === 'degraded' || !store) {
-              return {
-                name,
-                root: config.repoRoot,
-                memoryPath: config.memoryPath,
-                health: 'degraded',
-                error: health.status === 'degraded' ? health.error : 'Store not initialized',
-                recovery: health.status === 'degraded' ? health.recovery : ['Toggle MCP to restart'],
-              };
-            }
-
-            const stats = await store.stats();
-            return {
-              name,
-              root: config.repoRoot,
-              memoryPath: config.memoryPath,
-              health: 'healthy',
-              entries: stats.totalEntries,
-              storageUsed: stats.storageSize,
-              storageBudget: `${Math.round(config.storageBudgetBytes / 1024 / 1024)}MB`,
-            };
-          })
-        );
-
+        // Delegates to shared builder — same data as memory://lobes resource
+        const lobeInfo = await buildLobeInfo();
         const globalStats = await globalStore.stats();
         const result = {
           serverMode: serverMode.kind,
@@ -443,7 +437,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           configFile: configFileDisplay(),
           configSource: configOrigin.source,
           totalLobes: lobeInfo.length,
-          degradedLobes: lobeInfo.filter(l => l.health === 'degraded').length,
+          degradedLobes: lobeInfo.filter((l: { health: string }) => l.health === 'degraded').length,
         };
 
         return {
@@ -452,12 +446,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'memory_store': {
-        const { lobe: rawLobe, topic: rawTopic, title, content, sources, trust: rawTrust } = z.object({
+        const { lobe: rawLobe, topic: rawTopic, title, content, sources, references, trust: rawTrust } = z.object({
           lobe: z.string().optional(),
           topic: z.string(),
           title: z.string().min(1),
           content: z.string().min(1),
           sources: z.array(z.string()).default([]),
+          references: z.array(z.string()).default([]),
           trust: z.enum(['user', 'agent-confirmed', 'agent-inferred']).default('agent-inferred'),
         }).parse(args);
 
@@ -484,7 +479,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content,
           sources,
           // User/preferences default to 'user' trust unless explicitly set otherwise
-          isGlobal && trust === 'agent-inferred' ? 'user' : trust
+          isGlobal && trust === 'agent-inferred' ? 'user' : trust,
+          references,
         );
 
         if (!result.stored) {
@@ -499,8 +495,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ];
         if (result.warning) lines.push(`Note: ${result.warning}`);
 
+        // Limit to at most 2 hint sections per response to prevent hint fatigue.
+        // Priority: dedup > ephemeral > preferences (dedup is actionable and high-signal,
+        // ephemeral warnings affect entry quality, preferences are informational).
+        let hintCount = 0;
+
         // Dedup: surface related entries in the same topic
-        if (result.relatedEntries && result.relatedEntries.length > 0) {
+        if (result.relatedEntries && result.relatedEntries.length > 0 && hintCount < 2) {
+          hintCount++;
           lines.push('');
           lines.push('⚠ Similar entries found in the same topic:');
           for (const r of result.relatedEntries) {
@@ -511,8 +513,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           lines.push('To consolidate: memory_correct(id: "<old-id>", action: "replace", correction: "<merged content>") then memory_correct(id: "<new-id>", action: "delete")');
         }
 
+        // Ephemeral content warning — soft nudge, never blocking
+        if (result.ephemeralWarning && hintCount < 2) {
+          hintCount++;
+          lines.push('');
+          lines.push(`⏳ ${result.ephemeralWarning}`);
+        }
+
         // Preference surfacing: show relevant preferences for non-preference entries
-        if (result.relevantPreferences && result.relevantPreferences.length > 0) {
+        if (result.relevantPreferences && result.relevantPreferences.length > 0 && hintCount < 2) {
+          hintCount++;
           lines.push('');
           lines.push('📌 Relevant preferences:');
           for (const p of result.relevantPreferences) {
@@ -577,17 +587,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               `Trust: ${e.trust}`,
               `Fresh: ${e.fresh}`,
               e.sources?.length ? `Sources: ${e.sources.join(', ')}` : null,
+              e.references?.length ? `References: ${e.references.join(', ')}` : null,
               `Created: ${e.created}`,
               `Last accessed: ${e.lastAccessed}`,
               e.gitSha ? `Git SHA: ${e.gitSha}` : null,
             ].filter(Boolean).join('\n');
             return `### ${e.title}\n${meta}\n\n${e.content}`;
           }
+          if (detail === 'standard' && e.references?.length) {
+            return `### ${e.title}\n*${e.id} | confidence: ${e.confidence}${freshIndicator}*\nReferences: ${e.references.join(', ')}\n\n${e.summary}`;
+          }
           return `### ${e.title}\n*${e.id} | confidence: ${e.confidence}${freshIndicator}*\n\n${e.summary}`;
         });
 
         const totalCount = allEntries.length;
         let text = `## [${ctx.label}] Query: ${scope} (${totalCount} entries)\n\n${lines.join('\n\n')}`;
+
+        // Conflict detection: compare entry pairs in the result set.
+        // Fetch raw entries (which have full content) for the matching IDs.
+        const rawEntries = ctx.store.getEntriesByIds(result.entries.map(e => e.id));
+        const conflicts = ctx.store.detectConflicts(rawEntries);
+        if (conflicts.length > 0) {
+          text += '\n\n' + formatConflictWarning(conflicts);
+        }
 
         // Hints: teach the agent about capabilities it may not know about
         const hints: string[] = [];
@@ -621,7 +643,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (previousCrash) await clearLatestCrash();
 
         // Surface degraded lobes warning
-        const degradedLobeNames = lobeNames.filter(n => lobeHealth.get(n)?.status === 'degraded');
+        const lobeNames = configManager.getLobeNames();
+        const degradedLobeNames = lobeNames.filter(n => configManager.getLobeHealth(n)?.status === 'degraded');
         const degradedSection = degradedLobeNames.length > 0
           ? `## ⚠ Degraded Lobes: ${degradedLobeNames.join(', ')}\nRun **memory_diagnose** for details.\n`
           : '';
@@ -645,6 +668,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           sections.push(`# [${ctx.label}]\n\n${result.briefing}`);
 
           let text = sections.join('\n\n---\n\n');
+          if (result.staleDetails && result.staleDetails.length > 0) {
+            text += '\n\n' + formatStaleSection(result.staleDetails);
+          }
           const totalCount = result.entryCount + globalBriefing.entryCount;
           text += `\n\n---\n*${totalCount} entries (${globalBriefing.entryCount} global + ${result.entryCount} lobe) | ${result.staleEntries} stale*`;
           if (result.suggestion) text += `\n\n${result.suggestion}`;
@@ -661,16 +687,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         let totalEntries = globalBriefing.entryCount;
         let totalStale = globalBriefing.staleEntries;
-        const perLobeTokens = Math.floor(maxTokens / lobeNames.length);
+        const allLobeNames = configManager.getLobeNames();
+        const perLobeTokens = Math.floor(maxTokens / allLobeNames.length);
 
-        for (const lobeName of lobeNames) {
-          const health = lobeHealth.get(lobeName);
+        for (const lobeName of allLobeNames) {
+          const health = configManager.getLobeHealth(lobeName);
           if (health?.status === 'degraded') {
             sections.push(`# [${lobeName}]\n\n❌ Degraded: ${health.error}`);
             continue;
           }
 
-          const store = stores.get(lobeName);
+          const store = configManager.getStore(lobeName);
           if (!store) {
             sections.push(`# [${lobeName}]\n\n⚠ Store not initialized.`);
             continue;
@@ -684,6 +711,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             sections.push(`# [${lobeName}]\n\n${result.briefing}`);
           } else {
             sections.push(`# [${lobeName}]\n\nNo knowledge stored. Try memory_bootstrap(lobe: "${lobeName}").`);
+          }
+
+          if (result.staleDetails && result.staleDetails.length > 0) {
+            sections.push(formatStaleSection(result.staleDetails));
           }
         }
 
@@ -702,9 +733,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           action: z.enum(['append', 'replace', 'delete']),
         }).parse(args);
 
-        if (action !== 'delete' && !correction) {
+        // Replace requires non-empty content; append allows empty string (acts as a timestamp touch
+        // to refresh lastAccessed without changing content — useful for stale entry verification)
+        if (action === 'replace' && !correction) {
           return {
-            content: [{ type: 'text', text: 'Correction text is required for append/replace actions.' }],
+            content: [{ type: 'text', text: 'Correction text is required for replace action.' }],
+            isError: true,
+          };
+        }
+        if (action === 'append' && correction === undefined) {
+          return {
+            content: [{ type: 'text', text: 'Correction text is required for append action. Use "" to refresh lastAccessed without changing content.' }],
             isError: true,
           };
         }
@@ -786,7 +825,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return {
             content: [{
               type: 'text',
-              text: `[${ctx.label}] No relevant knowledge found for: "${context}"\n\nTry memory_query with scope: "*" to see all stored knowledge, or memory_bootstrap to seed initial entries.`,
+              text: `[${ctx.label}] No relevant knowledge found for: "${context}"\n\nThis is fine — proceed without prior context. As you learn things worth remembering, store them with memory_store.\nIf the lobe may already have knowledge, try memory_query(scope: "*") to browse all entries.`,
             }],
           };
         }
@@ -825,6 +864,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           sections.push('');
         }
 
+        // Conflict detection on the result set (cross-topic — exactly when the agent needs it)
+        const ctxConflicts = ctx.store.detectConflicts(results.map(r => r.entry));
+        if (ctxConflicts.length > 0) {
+          sections.push(formatConflictWarning(ctxConflicts));
+        }
+
+        // Collect all matched keywords and topics for the dedup hint
+        const allMatchedKeywords = new Set<string>();
+        const matchedTopics = new Set<string>();
+        for (const r of results) {
+          for (const kw of r.matchedKeywords) allMatchedKeywords.add(kw);
+          matchedTopics.add(r.entry.topic);
+        }
+
         // Hints
         const ctxHints: string[] = [];
         if (results.length >= max) {
@@ -833,6 +886,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (threshold <= 0.2 && results.length > 5) {
           ctxHints.push('Too many results? Use minMatch: 0.4 for stricter matching.');
         }
+
+        // Session dedup hint — tell the agent not to re-call for these keywords
+        if (allMatchedKeywords.size > 0) {
+          const kwList = Array.from(allMatchedKeywords).sort().join(', ');
+          const topicList = Array.from(matchedTopics).sort().join(', ');
+          ctxHints.push(
+            `Context loaded for: ${kwList} (${topicList}). ` +
+            `This knowledge is now in your conversation — no need to call memory_context again for these terms this session.`
+          );
+        }
+
         if (ctxHints.length > 0) {
           sections.push(`---\n*${ctxHints.join(' ')}*`);
         }
@@ -859,8 +923,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Combined stats across all lobes
         const sections: string[] = [formatStats('global (user + preferences)', globalStats)];
-        for (const lobeName of lobeNames) {
-          const store = stores.get(lobeName)!;
+        const allLobeNames = configManager.getLobeNames();
+        for (const lobeName of allLobeNames) {
+          const store = configManager.getStore(lobeName)!;
           const result = await store.stats();
           sections.push(formatStats(lobeName, result));
         }
@@ -896,91 +961,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'memory_diagnose': {
+        // Delegates to shared builder — same data as memory://diagnostics resource
         const { showCrashHistory } = z.object({
           showCrashHistory: z.boolean().default(false),
         }).parse(args ?? {});
 
-        const sections: string[] = [];
-
-        // Server status
-        sections.push(`## Memory MCP Server Diagnostics`);
-        sections.push('');
-        sections.push(`**Server mode:** ${serverMode.kind}`);
-        sections.push(`**Uptime:** ${Math.round((Date.now() - serverStartTime) / 1000)}s`);
-        sections.push(`**Config source:** ${configOrigin.source}`);
-        sections.push(`**Lobes:** ${lobeNames.length} configured`);
-        sections.push('');
-
-        // Per-lobe health
-        sections.push(`### Lobe Health`);
-        for (const lobeName of lobeNames) {
-          const health = lobeHealth.get(lobeName) ?? { status: 'healthy' as const };
-          if (health.status === 'healthy') {
-            const store = stores.get(lobeName);
-            if (store) {
-              const stats = await store.stats();
-              sections.push(`- **${lobeName}**: ✅ healthy (${stats.totalEntries} entries, ${stats.storageSize}${stats.corruptFiles > 0 ? `, ${stats.corruptFiles} corrupt files` : ''})`);
-            } else {
-              sections.push(`- **${lobeName}**: ⚠ store not initialized`);
-            }
-          } else {
-            sections.push(`- **${lobeName}**: ❌ degraded — ${health.error}`);
-            for (const step of health.recovery) {
-              sections.push(`  - ${step}`);
-            }
-          }
-        }
-        sections.push('');
-
-        // Global store health
-        try {
-          const globalStats = await globalStore.stats();
-          sections.push(`- **global store**: ✅ healthy (${globalStats.totalEntries} entries, ${globalStats.storageSize})`);
-        } catch (e) {
-          sections.push(`- **global store**: ❌ error — ${e instanceof Error ? e.message : e}`);
-        }
-        sections.push('');
-
-        // Crash history
-        const latestCrash = await readLatestCrash();
-        if (latestCrash) {
-          sections.push('### Latest Crash');
-          sections.push(formatCrashReport(latestCrash));
-          sections.push('');
-
-          await clearLatestCrash();
-        } else {
-          sections.push('### Crash History');
-          sections.push('No recent crashes recorded. ✅');
-          sections.push('');
-        }
-
-        if (showCrashHistory) {
-          const history = await readCrashHistory(10);
-          if (history.length > 0) {
-            sections.push('### Full Crash History (last 10)');
-            for (const crash of history) {
-              sections.push(`- **${crash.timestamp}** [${crash.type}]: ${crash.error.substring(0, 100)}`);
-              sections.push(`  Phase: ${crash.context.phase}, Uptime: ${crash.serverUptime}s`);
-            }
-            sections.push('');
-          }
-        }
-
-        // Safe mode instructions
-        if (serverMode.kind === 'safe-mode') {
-          sections.push('### Safe Mode Recovery');
-          sections.push('The server is in safe mode — knowledge tools are disabled.');
-          for (const step of serverMode.recovery) {
-            sections.push(`- ${step}`);
-          }
-        } else if (serverMode.kind === 'degraded') {
-          sections.push('### Degraded Mode');
-          sections.push(`Some lobes have issues: ${serverMode.reason}`);
-          sections.push('Healthy lobes continue to work normally.');
-        }
-
-        return { content: [{ type: 'text', text: sections.join('\n') }] };
+        const text = await buildDiagnosticsText(showCrashHistory);
+        return { content: [{ type: 'text', text }] };
       }
 
       default:
@@ -995,6 +982,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Provide helpful hints for common Zod validation errors
     let hint = '';
     if (message.includes('"lobe"') && message.includes('Required')) {
+      const lobeNames = configManager.getLobeNames();
       hint = `\n\nHint: lobe is required. Use memory_list_lobes to see available lobes. Available: ${lobeNames.join(', ')}`;
     } else if (message.includes('"topic"') || message.includes('"title"') || message.includes('"content"')) {
       hint = '\n\nHint: memory_store requires: lobe, topic (architecture|conventions|gotchas|recent-work), title, content';
@@ -1010,6 +998,191 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // --- Helpers ---
+
+/** Build lobe info array — shared by memory_list_lobes tool and memory://lobes resource */
+async function buildLobeInfo() {
+  const lobeNames = configManager.getLobeNames();
+  return Promise.all(
+    lobeNames.map(async (name) => {
+      const config = configManager.getLobeConfig(name)!;
+      const health = configManager.getLobeHealth(name) ?? { status: 'healthy' as const };
+      const store = configManager.getStore(name);
+
+      if (health.status === 'degraded' || !store) {
+        return {
+          name,
+          root: config.repoRoot,
+          memoryPath: config.memoryPath,
+          health: 'degraded',
+          error: health.status === 'degraded' ? health.error : 'Store not initialized',
+          recovery: health.status === 'degraded' ? health.recovery : ['Toggle MCP to restart'],
+        };
+      }
+
+      const stats = await store.stats();
+      return {
+        name,
+        root: config.repoRoot,
+        memoryPath: config.memoryPath,
+        health: 'healthy',
+        entries: stats.totalEntries,
+        storageUsed: stats.storageSize,
+        storageBudget: `${Math.round(config.storageBudgetBytes / 1024 / 1024)}MB`,
+      };
+    })
+  );
+}
+
+/** Build diagnostics text — shared by memory_diagnose tool and memory://diagnostics resource */
+async function buildDiagnosticsText(showFullCrashHistory: boolean): Promise<string> {
+  const sections: string[] = [];
+
+  const lobeNames = configManager.getLobeNames();
+  const configOrigin = configManager.getConfigOrigin();
+
+  sections.push(`## Memory MCP Server Diagnostics`);
+  sections.push('');
+  sections.push(`**Server mode:** ${serverMode.kind}`);
+  sections.push(`**Uptime:** ${Math.round((Date.now() - serverStartTime) / 1000)}s`);
+  sections.push(`**Config source:** ${configOrigin.source}`);
+  sections.push(`**Lobes:** ${lobeNames.length} configured`);
+  sections.push('');
+
+  sections.push(`### Lobe Health`);
+  for (const lobeName of lobeNames) {
+    const health = configManager.getLobeHealth(lobeName) ?? { status: 'healthy' as const };
+    if (health.status === 'healthy') {
+      const store = configManager.getStore(lobeName);
+      if (store) {
+        const stats = await store.stats();
+        sections.push(`- **${lobeName}**: ✅ healthy (${stats.totalEntries} entries, ${stats.storageSize}${stats.corruptFiles > 0 ? `, ${stats.corruptFiles} corrupt files` : ''})`);
+      } else {
+        sections.push(`- **${lobeName}**: ⚠ store not initialized`);
+      }
+    } else {
+      sections.push(`- **${lobeName}**: ❌ degraded — ${health.error}`);
+      for (const step of health.recovery) {
+        sections.push(`  - ${step}`);
+      }
+    }
+  }
+  sections.push('');
+
+  try {
+    const globalStats = await globalStore.stats();
+    sections.push(`- **global store**: ✅ healthy (${globalStats.totalEntries} entries, ${globalStats.storageSize})`);
+  } catch (e) {
+    sections.push(`- **global store**: ❌ error — ${e instanceof Error ? e.message : e}`);
+  }
+  sections.push('');
+
+  // Active behavior config — shows effective values and highlights user overrides
+  sections.push('### Active Behavior Config');
+  sections.push(formatBehaviorConfigSection(configBehavior));
+  sections.push('');
+
+  const latestCrash = await readLatestCrash();
+  if (latestCrash) {
+    sections.push('### Latest Crash');
+    sections.push(formatCrashReport(latestCrash));
+    sections.push('');
+    await clearLatestCrash();
+  } else {
+    sections.push('### Crash History');
+    sections.push('No recent crashes recorded. ✅');
+    sections.push('');
+  }
+
+  if (showFullCrashHistory) {
+    const history = await readCrashHistory(10);
+    if (history.length > 0) {
+      sections.push('### Full Crash History (last 10)');
+      for (const crash of history) {
+        sections.push(`- **${crash.timestamp}** [${crash.type}]: ${crash.error.substring(0, 100)}`);
+        sections.push(`  Phase: ${crash.context.phase}, Uptime: ${crash.serverUptime}s`);
+      }
+      sections.push('');
+    }
+  }
+
+  if (serverMode.kind === 'safe-mode') {
+    sections.push('### Safe Mode Recovery');
+    sections.push('The server is in safe mode — knowledge tools are disabled.');
+    for (const step of serverMode.recovery) {
+      sections.push(`- ${step}`);
+    }
+  } else if (serverMode.kind === 'degraded') {
+    sections.push('### Degraded Mode');
+    sections.push(`Some lobes have issues: ${serverMode.reason}`);
+    sections.push('Healthy lobes continue to work normally.');
+  }
+
+  return sections.join('\n');
+}
+
+/** Format the active behavior config section for diagnostics.
+ *  Shows effective values and marks overrides vs defaults clearly. */
+function formatBehaviorConfigSection(behavior?: BehaviorConfig): string {
+  const effectiveStaleStandard = behavior?.staleDaysStandard ?? DEFAULT_STALE_DAYS_STANDARD;
+  const effectiveStalePrefs = behavior?.staleDaysPreferences ?? DEFAULT_STALE_DAYS_PREFERENCES;
+  const effectiveMaxStale = behavior?.maxStaleInBriefing ?? DEFAULT_MAX_STALE_IN_BRIEFING;
+  const effectiveMaxDedup = behavior?.maxDedupSuggestions ?? DEFAULT_MAX_DEDUP_SUGGESTIONS;
+  const effectiveMaxConflict = behavior?.maxConflictPairs ?? DEFAULT_MAX_CONFLICT_PAIRS;
+
+  const hasOverrides = behavior && Object.keys(behavior).length > 0;
+
+  const tag = (val: number, def: number) => val !== def ? ' ← overridden' : ' (default)';
+
+  const lines = [
+    `- staleDaysStandard: ${effectiveStaleStandard}${tag(effectiveStaleStandard, DEFAULT_STALE_DAYS_STANDARD)}`,
+    `- staleDaysPreferences: ${effectiveStalePrefs}${tag(effectiveStalePrefs, DEFAULT_STALE_DAYS_PREFERENCES)}`,
+    `- maxStaleInBriefing: ${effectiveMaxStale}${tag(effectiveMaxStale, DEFAULT_MAX_STALE_IN_BRIEFING)}`,
+    `- maxDedupSuggestions: ${effectiveMaxDedup}${tag(effectiveMaxDedup, DEFAULT_MAX_DEDUP_SUGGESTIONS)}`,
+    `- maxConflictPairs: ${effectiveMaxConflict}${tag(effectiveMaxConflict, DEFAULT_MAX_CONFLICT_PAIRS)}`,
+  ];
+
+  if (!hasOverrides) {
+    lines.push('');
+    lines.push('All defaults active. To customize, add a "behavior" block to memory-config.json:');
+    lines.push('  { "behavior": { "staleDaysStandard": 14, "staleDaysPreferences": 60, "maxStaleInBriefing": 3 } }');
+  }
+
+  return lines.join('\n');
+}
+
+/** Format the stale entries section for the briefing response */
+function formatStaleSection(staleDetails: readonly StaleEntry[]): string {
+  const lines = [
+    `📋 ${staleDetails.length} stale ${staleDetails.length === 1 ? 'entry' : 'entries'} — verify accuracy or delete:`,
+    ...staleDetails.map(e => `  - ${e.id}: "${e.title}" (last accessed ${e.daysSinceAccess} days ago)`),
+    '',
+    'If still accurate: memory_correct(id: "...", action: "append", correction: "") — refreshes the timestamp',
+    'If outdated: memory_correct(id: "...", action: "replace", correction: "<updated content>") or action: "delete"',
+  ];
+  return lines.join('\n');
+}
+
+/** Format the conflict detection warning for query/context responses */
+function formatConflictWarning(conflicts: readonly ConflictPair[]): string {
+  const lines = ['⚠ Potential conflicts detected:'];
+  for (const c of conflicts) {
+    lines.push(`  - ${c.a.id}: "${c.a.title}" (confidence: ${c.a.confidence}, created: ${c.a.created.substring(0, 10)})`);
+    lines.push(`    vs ${c.b.id}: "${c.b.title}" (confidence: ${c.b.confidence}, created: ${c.b.created.substring(0, 10)})`);
+    lines.push(`    Similarity: ${(c.similarity * 100).toFixed(0)}%`);
+
+    // Guide the agent on which entry to trust
+    if (c.a.confidence !== c.b.confidence) {
+      const higher = c.a.confidence > c.b.confidence ? c.a : c.b;
+      lines.push(`    Higher confidence: ${higher.id} (${higher.confidence})`);
+    } else {
+      const newer = c.a.created > c.b.created ? c.a : c.b;
+      lines.push(`    More recent: ${newer.id} — may supersede the older entry`);
+    }
+  }
+  lines.push('');
+  lines.push('Consider: memory_correct to consolidate or clarify the difference between these entries.');
+  return lines.join('\n');
+}
 
 function formatStats(lobe: string, result: MemoryStats): string {
   const topicLines = Object.entries(result.byTopic)
@@ -1169,6 +1342,9 @@ async function main() {
       if (migrated > 0) process.stderr.write(`[memory-mcp] Migration complete: ${migrated} entries moved to global store.\n`);
     } catch { /* marker write is best-effort */ }
   }
+
+  // Initialize ConfigManager with current config state
+  configManager = new ConfigManager(configPath, { configs: lobeConfigs, origin: configOrigin }, stores, lobeHealth);
 
   const transport = new StdioServerTransport();
 

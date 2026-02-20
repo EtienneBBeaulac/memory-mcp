@@ -7,8 +7,15 @@ import { readFileSync } from 'fs';
 import { execFileSync } from 'child_process';
 import path from 'path';
 import os from 'os';
-import type { MemoryConfig } from './types.js';
+import type { MemoryConfig, BehaviorConfig } from './types.js';
 import { DEFAULT_STORAGE_BUDGET_BYTES } from './types.js';
+import {
+  DEFAULT_STALE_DAYS_STANDARD,
+  DEFAULT_STALE_DAYS_PREFERENCES,
+  DEFAULT_MAX_STALE_IN_BRIEFING,
+  DEFAULT_MAX_DEDUP_SUGGESTIONS,
+  DEFAULT_MAX_CONFLICT_PAIRS,
+} from './thresholds.js';
 
 /** How the config was loaded — discriminated union so configFilePath
  *  only exists when source is 'file' (illegal states unrepresentable) */
@@ -21,6 +28,16 @@ export type ConfigOrigin =
 export interface LoadedConfig {
   readonly configs: ReadonlyMap<string, MemoryConfig>;
   readonly origin: ConfigOrigin;
+  /** Resolved behavior config — present when a "behavior" block was found in memory-config.json */
+  readonly behavior?: BehaviorConfig;
+}
+
+interface MemoryConfigFileBehavior {
+  staleDaysStandard?: number;
+  staleDaysPreferences?: number;
+  maxStaleInBriefing?: number;
+  maxDedupSuggestions?: number;
+  maxConflictPairs?: number;
 }
 
 interface MemoryConfigFile {
@@ -29,6 +46,51 @@ interface MemoryConfigFile {
     memoryDir?: string;
     budgetMB?: number;
   }>;
+  /** Optional global behavior overrides applied to all lobes */
+  behavior?: MemoryConfigFileBehavior;
+}
+
+/** Validate and clamp a numeric threshold to a given range.
+ *  Returns the default if the value is missing, NaN, or out of range. */
+function clampThreshold(value: unknown, defaultValue: number, min: number, max: number): number {
+  if (value === undefined || value === null) return defaultValue;
+  const n = Number(value);
+  if (isNaN(n) || n < min || n > max) {
+    process.stderr.write(`[memory-mcp] Behavior threshold out of range [${min}, ${max}]: ${value} — using default ${defaultValue}\n`);
+    return defaultValue;
+  }
+  return Math.round(n); // integer thresholds only
+}
+
+/** Known behavior config keys — used to warn on typos/unknown fields at startup. */
+const KNOWN_BEHAVIOR_KEYS = new Set<string>([
+  'staleDaysStandard', 'staleDaysPreferences',
+  'maxStaleInBriefing', 'maxDedupSuggestions', 'maxConflictPairs',
+]);
+
+/** Parse and validate a behavior config block, falling back to defaults for each field.
+ *  Warns to stderr for unknown keys (likely typos) and out-of-range values.
+ *  Exported for testing — validates and clamps all fields. */
+export function parseBehaviorConfig(raw?: MemoryConfigFileBehavior): BehaviorConfig {
+  if (!raw) return {};
+
+  // Warn on unrecognized keys so typos don't silently produce defaults
+  for (const key of Object.keys(raw)) {
+    if (!KNOWN_BEHAVIOR_KEYS.has(key)) {
+      process.stderr.write(
+        `[memory-mcp] Unknown behavior config key "${key}" — ignored. ` +
+        `Valid keys: ${Array.from(KNOWN_BEHAVIOR_KEYS).join(', ')}\n`
+      );
+    }
+  }
+
+  return {
+    staleDaysStandard: clampThreshold(raw.staleDaysStandard, DEFAULT_STALE_DAYS_STANDARD, 1, 365),
+    staleDaysPreferences: clampThreshold(raw.staleDaysPreferences, DEFAULT_STALE_DAYS_PREFERENCES, 1, 730),
+    maxStaleInBriefing: clampThreshold(raw.maxStaleInBriefing, DEFAULT_MAX_STALE_IN_BRIEFING, 1, 20),
+    maxDedupSuggestions: clampThreshold(raw.maxDedupSuggestions, DEFAULT_MAX_DEDUP_SUGGESTIONS, 1, 10),
+    maxConflictPairs: clampThreshold(raw.maxConflictPairs, DEFAULT_MAX_CONFLICT_PAIRS, 1, 5),
+  };
 }
 
 function resolveRoot(root: string): string {
@@ -91,6 +153,9 @@ export function getLobeConfigs(): LoadedConfig {
     if (!external.lobes || typeof external.lobes !== 'object') {
       process.stderr.write(`[memory-mcp] Invalid memory-config.json: missing "lobes" object\n`);
     } else {
+      // Parse global behavior config once — applies to all lobes
+      const behavior = parseBehaviorConfig(external.behavior);
+
       for (const [name, config] of Object.entries(external.lobes)) {
         if (!config.root) {
           process.stderr.write(`[memory-mcp] Skipping lobe "${name}": missing "root" field\n`);
@@ -101,12 +166,15 @@ export function getLobeConfigs(): LoadedConfig {
           repoRoot,
           memoryPath: resolveMemoryPath(repoRoot, name, config.memoryDir),
           storageBudgetBytes: (config.budgetMB ?? 2) * 1024 * 1024,
+          behavior,
         });
       }
 
       if (configs.size > 0) {
         process.stderr.write(`[memory-mcp] Loaded ${configs.size} lobe(s) from memory-config.json\n`);
-        return { configs, origin: { source: 'file', path: configPath } };
+        // Pass resolved behavior at the top-level so diagnostics can surface active values
+        const resolvedBehavior = external.behavior ? parseBehaviorConfig(external.behavior) : undefined;
+        return { configs, origin: { source: 'file', path: configPath }, behavior: resolvedBehavior };
       }
     }
   } catch (error: unknown) {

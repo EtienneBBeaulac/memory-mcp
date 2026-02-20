@@ -885,4 +885,487 @@ describe('MarkdownMemoryStore', () => {
       assert.strictEqual(stats.corruptFiles, 1);
     });
   });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // BehaviorConfig: user-overridable thresholds
+  // ────────────────────────────────────────────────────────────────────────────
+
+  describe('BehaviorConfig overrides', () => {
+    it('staleDaysStandard overrides the default 30-day standard threshold', async () => {
+      const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+      const pastClock = { now: () => eightDaysAgo, isoNow: () => eightDaysAgo.toISOString() };
+
+      // Scenario A: default threshold (30 days) — 8-day-old entry should be fresh
+      const dirA = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-beh-a-'));
+      try {
+        const pastStoreA = new MarkdownMemoryStore({ repoRoot: dirA, memoryPath: path.join(dirA, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, clock: pastClock });
+        await pastStoreA.init();
+        await pastStoreA.store('architecture', 'Recent Pattern', 'An architecture pattern written 8 days ago');
+        const defaultStore = new MarkdownMemoryStore({ repoRoot: dirA, memoryPath: path.join(dirA, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES });
+        await defaultStore.init();
+        const resultA = await defaultStore.query('architecture', 'brief');
+        assert.ok(resultA.entries[0].fresh, 'Should be fresh under default 30-day threshold');
+      } finally {
+        await fs.rm(dirA, { recursive: true, force: true }).catch(() => {});
+      }
+
+      // Scenario B: staleDaysStandard: 5 — 8-day-old entry should be stale
+      const dirB = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-beh-b-'));
+      try {
+        const pastStoreB = new MarkdownMemoryStore({ repoRoot: dirB, memoryPath: path.join(dirB, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, clock: pastClock });
+        await pastStoreB.init();
+        await pastStoreB.store('architecture', 'Recent Pattern', 'An architecture pattern written 8 days ago');
+        const strictStore = new MarkdownMemoryStore({ repoRoot: dirB, memoryPath: path.join(dirB, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, behavior: { staleDaysStandard: 5 } });
+        await strictStore.init();
+        const resultB = await strictStore.query('architecture', 'brief');
+        assert.ok(!resultB.entries[0].fresh, 'Should be stale under custom 5-day threshold');
+      } finally {
+        await fs.rm(dirB, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    it('staleDaysPreferences overrides the default 90-day preferences threshold', async () => {
+      const fortyDaysAgo = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+      const pastClock = { now: () => fortyDaysAgo, isoNow: () => fortyDaysAgo.toISOString() };
+
+      // Scenario A: default (90 days) — 40-day-old preference should be fresh
+      const dirA = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-pref-a-'));
+      try {
+        const pastA = new MarkdownMemoryStore({ repoRoot: dirA, memoryPath: path.join(dirA, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, clock: pastClock });
+        await pastA.init();
+        await pastA.store('preferences', 'Old Pref', 'Preference written 40 days ago');
+        const readA = new MarkdownMemoryStore({ repoRoot: dirA, memoryPath: path.join(dirA, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES });
+        await readA.init();
+        const resultA = await readA.query('preferences', 'brief');
+        assert.ok(resultA.entries[0].fresh, 'Should be fresh under default 90-day threshold');
+      } finally {
+        await fs.rm(dirA, { recursive: true, force: true }).catch(() => {});
+      }
+
+      // Scenario B: staleDaysPreferences: 30 — 40-day-old preference should be stale
+      const dirB = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-pref-b-'));
+      try {
+        const pastB = new MarkdownMemoryStore({ repoRoot: dirB, memoryPath: path.join(dirB, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, clock: pastClock });
+        await pastB.init();
+        await pastB.store('preferences', 'Old Pref', 'Preference written 40 days ago');
+        const strictB = new MarkdownMemoryStore({ repoRoot: dirB, memoryPath: path.join(dirB, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, behavior: { staleDaysPreferences: 30 } });
+        await strictB.init();
+        const resultB = await strictB.query('preferences', 'brief');
+        assert.ok(!resultB.entries[0].fresh, 'Should be stale under custom 30-day preferences threshold');
+      } finally {
+        await fs.rm(dirB, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    it('maxStaleInBriefing caps the number of stale entries surfaced', async () => {
+      const thirtyFiveDaysAgo = new Date(Date.now() - 35 * 24 * 60 * 60 * 1000);
+      const pastClock = { now: () => thirtyFiveDaysAgo, isoNow: () => thirtyFiveDaysAgo.toISOString() };
+
+      const pastStore = new MarkdownMemoryStore({ ...makeConfig(tempDir), clock: pastClock });
+      await pastStore.init();
+      for (let i = 0; i < 6; i++) {
+        await pastStore.store('architecture', `Pattern ${i}`, `Architecture content for entry number ${i}`);
+      }
+
+      // Default cap: 5
+      const defaultStore = new MarkdownMemoryStore(makeConfig(tempDir));
+      await defaultStore.init();
+      const defaultBriefing = await defaultStore.briefing(5000);
+      assert.ok(defaultBriefing.staleDetails && defaultBriefing.staleDetails.length <= 5, `Default cap: should be ≤ 5, got ${defaultBriefing.staleDetails?.length}`);
+
+      // Custom cap: 2
+      const limitedStore = new MarkdownMemoryStore({ ...makeConfig(tempDir), behavior: { maxStaleInBriefing: 2 } });
+      await limitedStore.init();
+      const limitedBriefing = await limitedStore.briefing(5000);
+      assert.ok(limitedBriefing.staleDetails && limitedBriefing.staleDetails.length <= 2, `Custom cap: should be ≤ 2, got ${limitedBriefing.staleDetails?.length}`);
+    });
+
+    it('maxDedupSuggestions limits dedup results at write time', async () => {
+      // Create 4 similar entries first
+      const sharedContent = 'MVI architecture uses standalone reducers with sealed interface events and state management';
+      for (let i = 0; i < 4; i++) {
+        await store.store('architecture', `Pattern Base ${i}`, `${sharedContent} variation ${i}`);
+      }
+
+      // Store a new similar entry with maxDedupSuggestions: 1
+      const limitedStore = new MarkdownMemoryStore({ ...makeConfig(tempDir), behavior: { maxDedupSuggestions: 1 } });
+      await limitedStore.init();
+      const result = await limitedStore.store('architecture', 'New MVI Entry', `${sharedContent} new pattern`);
+
+      assert.ok(result.stored);
+      if (!result.stored) return;
+      // Should surface at most 1 dedup suggestion even though 4 similar entries exist
+      assert.ok(!result.relatedEntries || result.relatedEntries.length <= 1, `Should have at most 1 dedup suggestion, got ${result.relatedEntries?.length}`);
+    });
+
+    it('maxConflictPairs limits conflicts per query response', async () => {
+      // Create 4 very similar entries across topics
+      const sharedContent = 'This codebase uses MVI architecture with standalone reducers sealed interfaces events and ViewModel orchestration following clean architecture principles with Kotlin coroutines';
+      const ids: string[] = [];
+      const topics = ['architecture', 'conventions', 'gotchas', 'recent-work'] as const;
+      for (const topic of topics) {
+        const r = await store.store(topic, `MVI Overview ${topic}`, `${sharedContent} in ${topic}`);
+        assert.ok(r.stored);
+        if (r.stored) ids.push(r.id);
+      }
+
+      // With maxConflictPairs: 1
+      const limitedStore = new MarkdownMemoryStore({ ...makeConfig(tempDir), behavior: { maxConflictPairs: 1 } });
+      await limitedStore.init();
+      const entries = limitedStore.getEntriesByIds(ids);
+      const conflicts = limitedStore.detectConflicts(entries);
+
+      assert.ok(conflicts.length <= 1, `Should return at most 1 conflict pair, got ${conflicts.length}`);
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Feature 1: references field
+  // ────────────────────────────────────────────────────────────────────────────
+
+  describe('references field', () => {
+    it('stores and persists references to disk', async () => {
+      const refs = ['features/messaging/impl/MessagingReducer.kt', 'features/messaging/impl/MessagingState.kt'];
+      const result = await store.store('architecture', 'Messaging Reducer', 'Standalone reducer for messaging state', [], 'agent-inferred', refs);
+      assert.ok(result.stored);
+      if (!result.stored) return;
+
+      // Verify raw file contains references metadata line
+      const filePath = path.join(tempDir, '.memory', 'architecture', `${result.id}.md`);
+      const raw = await fs.readFile(filePath, 'utf-8');
+      assert.ok(raw.includes('- **references**: features/messaging/impl/MessagingReducer.kt, features/messaging/impl/MessagingState.kt'));
+    });
+
+    it('parses references back from disk on reload', async () => {
+      const refs = ['features/messaging/impl/MessagingReducer.kt'];
+      const storeResult = await store.store('architecture', 'Reducer Entry', 'Uses MVI reducer pattern', [], 'agent-inferred', refs);
+      assert.ok(storeResult.stored);
+
+      // Force reload from disk with a fresh store instance
+      const store2 = new MarkdownMemoryStore(makeConfig(tempDir));
+      await store2.init();
+      const query = await store2.query('architecture', 'full');
+
+      const entry = query.entries.find(e => e.title === 'Reducer Entry');
+      assert.ok(entry, 'Entry should exist after reload');
+      assert.deepStrictEqual(entry!.references, ['features/messaging/impl/MessagingReducer.kt']);
+    });
+
+    it('surfaces references in full detail query', async () => {
+      const refs = ['src/Foo.kt', 'src/Bar.kt'];
+      await store.store('conventions', 'Foo Pattern', 'Uses Foo and Bar pattern', [], 'agent-inferred', refs);
+      const result = await store.query('conventions', 'full');
+
+      assert.ok(result.entries.length === 1);
+      assert.deepStrictEqual(result.entries[0].references, ['src/Foo.kt', 'src/Bar.kt']);
+    });
+
+    it('surfaces references in standard detail query', async () => {
+      const refs = ['src/Foo.kt'];
+      await store.store('conventions', 'Foo Pattern', 'Uses Foo pattern', [], 'agent-inferred', refs);
+      const result = await store.query('conventions', 'standard');
+
+      assert.deepStrictEqual(result.entries[0].references, ['src/Foo.kt']);
+    });
+
+    it('omits references in brief detail query', async () => {
+      const refs = ['src/Foo.kt'];
+      await store.store('conventions', 'Foo Pattern', 'Uses Foo pattern', [], 'agent-inferred', refs);
+      const result = await store.query('conventions', 'brief');
+
+      assert.ok(!result.entries[0].references, 'Brief detail should not include references');
+    });
+
+    it('omits references metadata line when empty', async () => {
+      const result = await store.store('architecture', 'No Refs Entry', 'Content without references');
+      assert.ok(result.stored);
+      if (!result.stored) return;
+      const filePath = path.join(tempDir, '.memory', 'architecture', `${result.id}.md`);
+      const raw = await fs.readFile(filePath, 'utf-8');
+      assert.ok(!raw.includes('- **references**:'), 'Should not write references line when empty');
+    });
+
+    it('boosts context search score when reference path matches context keyword', async () => {
+      // Entry with reference to MessagingReducer should rank above a similar entry without it
+      const withRef = await store.store('architecture', 'State Machine', 'Handles state transitions for features', [], 'agent-inferred', ['features/messaging/impl/MessagingReducer.kt']);
+      const withoutRef = await store.store('architecture', 'State Handler', 'Handles state transitions for features using patterns', [], 'agent-inferred', []);
+      assert.ok(withRef.stored && withoutRef.stored);
+
+      const results = await store.contextSearch('MessagingReducer state transitions');
+      const refEntry = results.find(r => r.entry.title === 'State Machine');
+      const noRefEntry = results.find(r => r.entry.title === 'State Handler');
+
+      assert.ok(refEntry, 'Entry with reference should appear in results');
+      assert.ok(noRefEntry, 'Entry without reference should also appear');
+      assert.ok(refEntry!.score > noRefEntry!.score, `Entry with matching reference (score: ${refEntry!.score}) should rank higher than entry without (score: ${noRefEntry!.score})`);
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Feature 2: Staleness — tiered isFresh() thresholds
+  // ────────────────────────────────────────────────────────────────────────────
+
+  describe('staleness and isFresh() thresholds', () => {
+    it('user topic entries are never stale regardless of age', async () => {
+      const pastClock = {
+        now: () => new Date(Date.now() - 90 * 24 * 60 * 60 * 1000), // 90 days ago
+        isoNow: () => new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
+      };
+      const oldStore = new MarkdownMemoryStore({ ...makeConfig(tempDir), clock: pastClock });
+      await oldStore.init();
+      await oldStore.store('user', 'Identity', 'Etienne, Senior Engineer', [], 'user');
+
+      const currentStore = new MarkdownMemoryStore(makeConfig(tempDir));
+      await currentStore.init();
+      const query = await currentStore.query('user', 'full');
+      assert.ok(query.entries[0].fresh, 'User topic entries should always be fresh');
+    });
+
+    it('preferences entries are stale after 90 days but fresh before', async () => {
+      const seventyDaysAgo = new Date(Date.now() - 70 * 24 * 60 * 60 * 1000);
+      const ninetyFiveDaysAgo = new Date(Date.now() - 95 * 24 * 60 * 60 * 1000);
+
+      const clock70 = { now: () => seventyDaysAgo, isoNow: () => seventyDaysAgo.toISOString() };
+      const clock95 = { now: () => ninetyFiveDaysAgo, isoNow: () => ninetyFiveDaysAgo.toISOString() };
+
+      // Write with 70-days-ago clock, read with current clock → 70 days elapsed → fresh
+      const store70 = new MarkdownMemoryStore({ ...makeConfig(tempDir), clock: clock70 });
+      await store70.init();
+      await store70.store('preferences', 'Pref 70', 'Use MVI everywhere');
+      // Re-read with current clock to check freshness at current time
+      const currentStore70 = new MarkdownMemoryStore(makeConfig(tempDir));
+      await currentStore70.init();
+      const result70 = await currentStore70.query('preferences', 'brief');
+      assert.ok(result70.entries[0].fresh, '70-day-old preference should be fresh (within 90-day window)');
+
+      // New temp dir for the 95-day test — write with 95-days-ago clock, read with current clock
+      const dir95 = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-stale-'));
+      try {
+        const store95 = new MarkdownMemoryStore({ repoRoot: dir95, memoryPath: path.join(dir95, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, clock: clock95 });
+        await store95.init();
+        await store95.store('preferences', 'Pref 95', 'Use MVI everywhere');
+        // Re-read with current clock to check freshness at current time
+        const currentStore95 = new MarkdownMemoryStore({ repoRoot: dir95, memoryPath: path.join(dir95, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES });
+        await currentStore95.init();
+        const result95 = await currentStore95.query('preferences', 'brief');
+        assert.ok(!result95.entries[0].fresh, '95-day-old preference should be stale (exceeds 90-day window)');
+      } finally {
+        await fs.rm(dir95, { recursive: true, force: true });
+      }
+    });
+
+    it('gotcha entries go stale after 30 days', async () => {
+      const thirtyFiveDaysAgo = new Date(Date.now() - 35 * 24 * 60 * 60 * 1000);
+      const pastClock = { now: () => thirtyFiveDaysAgo, isoNow: () => thirtyFiveDaysAgo.toISOString() };
+
+      const pastStore = new MarkdownMemoryStore({ ...makeConfig(tempDir), clock: pastClock });
+      await pastStore.init();
+      await pastStore.store('gotchas', 'Build Gotcha', 'Run pod install first');
+
+      const currentStore = new MarkdownMemoryStore(makeConfig(tempDir));
+      await currentStore.init();
+      const query = await currentStore.query('gotchas', 'brief');
+      assert.ok(!query.entries[0].fresh, 'Gotcha entry 35 days old should be stale');
+    });
+
+    it('user-trusted entries in non-user topics go stale normally', async () => {
+      const thirtyFiveDaysAgo = new Date(Date.now() - 35 * 24 * 60 * 60 * 1000);
+      const pastClock = { now: () => thirtyFiveDaysAgo, isoNow: () => thirtyFiveDaysAgo.toISOString() };
+
+      const pastStore = new MarkdownMemoryStore({ ...makeConfig(tempDir), clock: pastClock });
+      await pastStore.init();
+      // Explicitly user-trusted but in architecture topic
+      await pastStore.store('architecture', 'Confirmed Pattern', 'Definitely uses MVI', [], 'user');
+
+      const currentStore = new MarkdownMemoryStore(makeConfig(tempDir));
+      await currentStore.init();
+      const query = await currentStore.query('architecture', 'brief');
+      assert.ok(!query.entries[0].fresh, 'User-trusted architecture entry should go stale (trust != temporal validity)');
+    });
+
+    it('briefing includes staleDetails for entries past their threshold', async () => {
+      const thirtyFiveDaysAgo = new Date(Date.now() - 35 * 24 * 60 * 60 * 1000);
+      const pastClock = { now: () => thirtyFiveDaysAgo, isoNow: () => thirtyFiveDaysAgo.toISOString() };
+
+      const pastStore = new MarkdownMemoryStore({ ...makeConfig(tempDir), clock: pastClock });
+      await pastStore.init();
+      await pastStore.store('architecture', 'Old Pattern', 'This was written 35 days ago');
+      await pastStore.store('gotchas', 'Old Gotcha', 'This gotcha is now stale');
+
+      const currentStore = new MarkdownMemoryStore(makeConfig(tempDir));
+      await currentStore.init();
+      const briefing = await currentStore.briefing(2000);
+
+      assert.ok(briefing.staleDetails && briefing.staleDetails.length > 0, 'Should have staleDetails for old entries');
+      assert.ok(briefing.staleDetails!.every(e => e.daysSinceAccess >= 35), 'All stale entries should be 35+ days old');
+    });
+
+    it('briefing staleDetails caps at 5 entries', async () => {
+      const thirtyFiveDaysAgo = new Date(Date.now() - 35 * 24 * 60 * 60 * 1000);
+      const pastClock = { now: () => thirtyFiveDaysAgo, isoNow: () => thirtyFiveDaysAgo.toISOString() };
+
+      const pastStore = new MarkdownMemoryStore({ ...makeConfig(tempDir), clock: pastClock });
+      await pastStore.init();
+      for (let i = 0; i < 8; i++) {
+        await pastStore.store('architecture', `Pattern ${i}`, `Content for pattern number ${i} in the architecture`);
+      }
+
+      const currentStore = new MarkdownMemoryStore(makeConfig(tempDir));
+      await currentStore.init();
+      const briefing = await currentStore.briefing(2000);
+
+      assert.ok(briefing.staleDetails && briefing.staleDetails.length <= 5, 'Should surface at most 5 stale entries');
+    });
+
+    it('briefing staleDetails prioritizes gotchas before architecture', async () => {
+      const thirtyFiveDaysAgo = new Date(Date.now() - 35 * 24 * 60 * 60 * 1000);
+      const pastClock = { now: () => thirtyFiveDaysAgo, isoNow: () => thirtyFiveDaysAgo.toISOString() };
+
+      const pastStore = new MarkdownMemoryStore({ ...makeConfig(tempDir), clock: pastClock });
+      await pastStore.init();
+      await pastStore.store('architecture', 'Arch Pattern', 'Old architecture knowledge here');
+      await pastStore.store('gotchas', 'Critical Gotcha', 'Old gotcha that should surface first');
+
+      const currentStore = new MarkdownMemoryStore(makeConfig(tempDir));
+      await currentStore.init();
+      const briefing = await currentStore.briefing(2000);
+
+      assert.ok(briefing.staleDetails && briefing.staleDetails.length >= 2);
+      assert.strictEqual(briefing.staleDetails![0].topic, 'gotchas', 'Gotchas should appear before architecture in stale list');
+    });
+
+    it('briefing staleDetails is undefined when no stale entries', async () => {
+      // Store a fresh entry (using current time, not past clock)
+      await store.store('architecture', 'Fresh Pattern', 'Just written right now');
+
+      const briefing = await store.briefing(2000);
+      assert.ok(!briefing.staleDetails || briefing.staleDetails.length === 0, 'Should have no staleDetails when all entries are fresh');
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // Feature 3: Conflict detection
+  // ────────────────────────────────────────────────────────────────────────────
+
+  describe('conflict detection', () => {
+    it('detects high-similarity entries as conflicts', async () => {
+      const a = await store.store('architecture', 'MVI Architecture', 'This codebase uses MVI architecture pattern with standalone reducers and sealed interfaces for state management events');
+      const b = await store.store('conventions', 'Architecture Pattern', 'This codebase uses MVI architecture with standalone reducers sealed interfaces and state management');
+      assert.ok(a.stored && b.stored);
+      if (!a.stored || !b.stored) return;
+
+      // Fetch raw entries and run detection
+      const entries = store.getEntriesByIds([a.id, b.id]);
+      const conflicts = store.detectConflicts(entries);
+
+      assert.ok(conflicts.length > 0, 'Should detect conflict between highly similar entries');
+      assert.ok(conflicts[0].similarity > 0.6, `Similarity ${conflicts[0].similarity} should exceed 0.6`);
+    });
+
+    it('does not flag dissimilar entries', async () => {
+      const a = await store.store('architecture', 'Build System', 'Uses Gradle with Kotlin DSL for build configuration and dependency management');
+      const b = await store.store('conventions', 'Networking', 'Retrofit with OkHttp for HTTP requests coroutines and suspend functions');
+      assert.ok(a.stored && b.stored);
+      if (!a.stored || !b.stored) return;
+
+      const entries = store.getEntriesByIds([a.id, b.id]);
+      const conflicts = store.detectConflicts(entries);
+
+      assert.strictEqual(conflicts.length, 0, 'Dissimilar entries should not be flagged as conflicts');
+    });
+
+    it('does not flag entries with short content', async () => {
+      // Short content (<=50 chars) — too noisy to be meaningful
+      const a = await store.store('architecture', 'Short A', 'Use MVI');
+      const b = await store.store('conventions', 'Short B', 'Use MVI pattern');
+      assert.ok(a.stored && b.stored);
+      if (!a.stored || !b.stored) return;
+
+      const entries = store.getEntriesByIds([a.id, b.id]);
+      const conflicts = store.detectConflicts(entries);
+
+      assert.strictEqual(conflicts.length, 0, 'Short content entries should not be flagged as conflicts');
+    });
+
+    it('caps results at 2 conflict pairs', async () => {
+      // Store 4 very similar entries
+      const ids: string[] = [];
+      const longContent = 'MVI architecture uses standalone reducers with sealed interfaces for state management and events in Kotlin';
+      for (let i = 0; i < 4; i++) {
+        const r = await store.store('architecture', `Pattern ${i}`, `${longContent} variation ${i}`);
+        assert.ok(r.stored);
+        if (r.stored) ids.push(r.id);
+      }
+
+      const entries = store.getEntriesByIds(ids);
+      const conflicts = store.detectConflicts(entries);
+
+      assert.ok(conflicts.length <= 2, `Should return at most 2 conflict pairs, got ${conflicts.length}`);
+    });
+
+    it('detects cross-topic conflicts', async () => {
+      const similarContent = 'This codebase follows strict MVI architecture with standalone reducer classes sealed interface events and ViewModel orchestration';
+      const a = await store.store('architecture', 'MVI Overview', similarContent);
+      const b = await store.store('conventions', 'Architecture Convention', similarContent + ' following clean architecture principles');
+      assert.ok(a.stored && b.stored);
+      if (!a.stored || !b.stored) return;
+
+      const entries = store.getEntriesByIds([a.id, b.id]);
+      const conflicts = store.detectConflicts(entries);
+
+      assert.ok(conflicts.length > 0, 'Should detect cross-topic conflicts');
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Ephemeral content detection at store time
+  // ────────────────────────────────────────────────────────────────────────
+
+  describe('ephemeral warnings', () => {
+    it('returns ephemeralWarning for content with temporal language', async () => {
+      const result = await store.store(
+        'gotchas',
+        'Build Issue',
+        'The build is currently broken due to a Gradle sync issue that appeared today',
+      );
+      assert.ok(result.stored, 'Should still store the entry');
+      if (!result.stored) return;
+      assert.ok(result.ephemeralWarning, 'Should include ephemeral warning');
+      assert.ok(result.ephemeralWarning!.includes('Temporal language'));
+    });
+
+    it('returns ephemeralWarning for fixed-bug content', async () => {
+      const result = await store.store(
+        'gotchas',
+        'Resolved Crash',
+        'The crash bug in the messaging reducer has been fixed after we updated the coroutine scope handling',
+      );
+      assert.ok(result.stored);
+      if (!result.stored) return;
+      assert.ok(result.ephemeralWarning, 'Should warn about resolved issues');
+      assert.ok(result.ephemeralWarning!.includes('Resolved issue'));
+    });
+
+    it('does not return ephemeralWarning for durable content', async () => {
+      const result = await store.store(
+        'architecture',
+        'MVI Pattern',
+        'The messaging feature uses MVI with standalone reducer classes and sealed interface events for exhaustive handling',
+      );
+      assert.ok(result.stored);
+      if (!result.stored) return;
+      assert.strictEqual(result.ephemeralWarning, undefined, 'Durable content should have no ephemeral warning');
+    });
+
+    it('skips ephemeral detection for recent-work topic', async () => {
+      const result = await store.store(
+        'recent-work',
+        'Current Investigation',
+        'Currently debugging a crash that just happened today in the messaging reducer — investigating the root cause',
+      );
+      assert.ok(result.stored);
+      if (!result.stored) return;
+      assert.strictEqual(result.ephemeralWarning, undefined, 'recent-work should bypass ephemeral detection');
+    });
+  });
 });
