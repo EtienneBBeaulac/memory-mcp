@@ -449,6 +449,7 @@ export class MarkdownMemoryStore {
       { file: 'go.mod', meaning: 'Go module' },
       { file: 'pyproject.toml', meaning: 'Python project' },
       { file: 'Tuist.swift', meaning: 'iOS project managed by Tuist' },
+      { file: 'project.godot', meaning: 'Godot Engine project (GDScript/C#)' },
     ];
 
     const detected: string[] = [];
@@ -477,6 +478,26 @@ export class MarkdownMemoryStore {
         [], 'agent-inferred'
       ));
     } catch { /* not a git repo or git not available */ }
+
+    // 5. Fallback: if nothing was detected, store a minimal overview so the lobe
+    //    is never left completely empty after bootstrap (makes memory_context useful immediately).
+    const storedCount = results.filter(r => r.stored).length;
+    if (storedCount === 0) {
+      try {
+        const topLevel = await fs.readdir(repoRoot, { withFileTypes: true });
+        const items = topLevel
+          .filter(d => !d.name.startsWith('.') && d.name !== 'node_modules')
+          .map(d => `${d.isDirectory() ? '[dir]' : '[file]'} ${d.name}`)
+          .join(', ');
+        results.push(await this.store(
+          'architecture', 'Repo Overview',
+          items.length > 0
+            ? `Minimal repository. Top-level contents: ${items}.`
+            : `Empty or newly initialized repository at ${repoRoot}.`,
+          [], 'agent-inferred'
+        ));
+      } catch { /* ignore */ }
+    }
 
     return results;
   }
