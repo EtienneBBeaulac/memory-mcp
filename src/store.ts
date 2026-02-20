@@ -15,8 +15,10 @@ import type {
 import { DEFAULT_CONFIDENCE, realClock, parseTopicScope, parseTrustLevel } from './types.js';
 import {
   DEDUP_SIMILARITY_THRESHOLD,
-  CONFLICT_SIMILARITY_THRESHOLD,
+  CONFLICT_SIMILARITY_THRESHOLD_SAME_TOPIC,
+  CONFLICT_SIMILARITY_THRESHOLD_CROSS_TOPIC,
   CONFLICT_MIN_CONTENT_CHARS,
+  OPPOSITION_PAIRS,
   PREFERENCE_SURFACE_THRESHOLD,
   REFERENCE_BOOST_MULTIPLIER,
   TOPIC_BOOST,
@@ -895,7 +897,7 @@ export class MarkdownMemoryStore {
    *  similarity exceeds 0.6. Returns at most 2 pairs to avoid overwhelming the agent.
    *
    *  Accepts a minimal shape so it works with both MemoryEntry and QueryEntry (full detail). */
-  detectConflicts(entries: readonly Pick<MemoryEntry, 'id' | 'title' | 'content' | 'confidence' | 'created'>[]): ConflictPair[] {
+  detectConflicts(entries: readonly Pick<MemoryEntry, 'id' | 'title' | 'content' | 'confidence' | 'created' | 'topic' | 'trust'>[]): ConflictPair[] {
     type Scored = { pair: ConflictPair; score: number };
     const conflicts: Scored[] = [];
 
@@ -907,15 +909,50 @@ export class MarkdownMemoryStore {
         // Skip entries with trivially short content — similarity on short text is noisy
         if (a.content.length <= CONFLICT_MIN_CONTENT_CHARS || b.content.length <= CONFLICT_MIN_CONTENT_CHARS) continue;
 
-        const score = similarity(a.title, a.content, b.title, b.content);
-        if (score > CONFLICT_SIMILARITY_THRESHOLD) {
+        const contentSim = similarity(a.title, a.content, b.title, b.content);
+        const titleSim = similarity(a.title, '', b.title, '');
+
+        // Tiered thresholds: cross-topic gets lower bar (more suspicious when different topics overlap)
+        const isSameTopic = a.topic === b.topic;
+        let threshold = isSameTopic ? CONFLICT_SIMILARITY_THRESHOLD_SAME_TOPIC : CONFLICT_SIMILARITY_THRESHOLD_CROSS_TOPIC;
+
+        // Title similarity: if titles overlap significantly, they're about the same thing
+        // Lower content threshold since even moderate overlap becomes suspicious
+        if (titleSim > 0.30) {
+          threshold = Math.min(threshold, 0.38);
+        }
+
+        // Trust level boost: two user-corrected entries contradicting is highest-signal
+        const bothUserTrust = a.trust === 'user' && b.trust === 'user';
+        const trustBoost = bothUserTrust ? 1.3 : 1.0;
+
+        // Opposition word detection: negation indicators suggest prescriptive contradiction
+        const NEGATION_INDICATORS = /\b(not|never|avoid|instead of|rather than|deprecated|obsolete|don'?t use)\b/gi;
+        const aNegations = (a.content.match(NEGATION_INDICATORS) || []).length;
+        const bNegations = (b.content.match(NEGATION_INDICATORS) || []).length;
+        const hasNegations = aNegations > 0 && bNegations > 0;
+
+        // Check for explicit opposition pairs in content
+        const aLower = a.content.toLowerCase();
+        const bLower = b.content.toLowerCase();
+        const oppositionMatch = OPPOSITION_PAIRS.some(([term1, term2]) =>
+          (aLower.includes(term1) && bLower.includes(term2)) ||
+          (aLower.includes(term2) && bLower.includes(term1))
+        );
+
+        // Opposition boost: entries using opposing keywords get stronger conflict signal
+        const oppositionBoost = (hasNegations || oppositionMatch) ? 1.25 : 1.0;
+
+        const adjustedScore = contentSim * trustBoost * oppositionBoost;
+
+        if (adjustedScore > threshold) {
           conflicts.push({
             pair: {
               a: { id: a.id, title: a.title, confidence: a.confidence, created: a.created },
               b: { id: b.id, title: b.title, confidence: b.confidence, created: b.created },
-              similarity: score,
+              similarity: contentSim, // store raw similarity for display transparency
             },
-            score,
+            score: adjustedScore, // sort by adjusted score
           });
         }
       }

@@ -16,14 +16,37 @@
 /** Minimum similarity score for dedup detection at write time (same-topic). */
 export const DEDUP_SIMILARITY_THRESHOLD = 0.35;
 
-/** Minimum similarity score for conflict detection at query time (cross-topic). */
-export const CONFLICT_SIMILARITY_THRESHOLD = 0.60;
+/** Minimum similarity score for conflict detection at query time — same topic.
+ *  Higher threshold since same-topic overlaps are often legitimate variations. */
+export const CONFLICT_SIMILARITY_THRESHOLD_SAME_TOPIC = 0.60;
+
+/** Minimum similarity score for conflict detection at query time — cross topic.
+ *  Lower threshold: if entries in different topics overlap this much, they're
+ *  likely talking about the same architectural decision, which is suspicious. */
+export const CONFLICT_SIMILARITY_THRESHOLD_CROSS_TOPIC = 0.42;
 
 /** Minimum similarity score for surfacing relevant preferences (cross-topic). */
 export const PREFERENCE_SURFACE_THRESHOLD = 0.20;
 
 /** Minimum content length (chars) for conflict detection — short entries are too noisy. */
 export const CONFLICT_MIN_CONTENT_CHARS = 50;
+
+/** Opposition keyword pairs for enhanced conflict detection.
+ *  When entries overlap AND use opposing terms, boost the conflict signal. */
+export const OPPOSITION_PAIRS: ReadonlyArray<readonly [string, string]> = [
+  ['use', 'avoid'],
+  ['always', 'never'],
+  ['prefer', 'avoid'],
+  ['required', 'forbidden'],
+  ['mandatory', 'optional'],
+  ['sync', 'async'],
+  ['mutable', 'immutable'],
+  ['mvi', 'mvvm'],
+  ['sealed class', 'sealed interface'],
+  ['inheritance', 'composition'],
+  ['throw', 'return'],       // exceptions vs Result types
+  ['imperative', 'declarative'],
+];
 
 /** Score multiplier when a reference path basename matches the context keywords. */
 export const REFERENCE_BOOST_MULTIPLIER = 1.30;
