@@ -495,8 +495,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ];
         if (result.warning) lines.push(`Note: ${result.warning}`);
 
+        // Limit to at most 2 hint sections per response to prevent hint fatigue.
+        // Priority: dedup > ephemeral > preferences (dedup is actionable and high-signal,
+        // ephemeral warnings affect entry quality, preferences are informational).
+        let hintCount = 0;
+
         // Dedup: surface related entries in the same topic
-        if (result.relatedEntries && result.relatedEntries.length > 0) {
+        if (result.relatedEntries && result.relatedEntries.length > 0 && hintCount < 2) {
+          hintCount++;
           lines.push('');
           lines.push('⚠ Similar entries found in the same topic:');
           for (const r of result.relatedEntries) {
@@ -507,8 +513,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           lines.push('To consolidate: memory_correct(id: "<old-id>", action: "replace", correction: "<merged content>") then memory_correct(id: "<new-id>", action: "delete")');
         }
 
+        // Ephemeral content warning — soft nudge, never blocking
+        if (result.ephemeralWarning && hintCount < 2) {
+          hintCount++;
+          lines.push('');
+          lines.push(`⏳ ${result.ephemeralWarning}`);
+        }
+
         // Preference surfacing: show relevant preferences for non-preference entries
-        if (result.relevantPreferences && result.relevantPreferences.length > 0) {
+        if (result.relevantPreferences && result.relevantPreferences.length > 0 && hintCount < 2) {
+          hintCount++;
           lines.push('');
           lines.push('📌 Relevant preferences:');
           for (const p of result.relevantPreferences) {
@@ -516,12 +530,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
           lines.push('');
           lines.push('Review the stored entry against these preferences for potential conflicts.');
-        }
-
-        // Ephemeral content warning — soft nudge, never blocking
-        if (result.ephemeralWarning) {
-          lines.push('');
-          lines.push(`⏳ ${result.ephemeralWarning}`);
         }
 
         return { content: [{ type: 'text', text: lines.join('\n') }] };
@@ -817,7 +825,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return {
             content: [{
               type: 'text',
-              text: `[${ctx.label}] No relevant knowledge found for: "${context}"\n\nTry memory_query with scope: "*" to see all stored knowledge, or memory_bootstrap to seed initial entries.`,
+              text: `[${ctx.label}] No relevant knowledge found for: "${context}"\n\nThis is fine — proceed without prior context. As you learn things worth remembering, store them with memory_store.\nIf the lobe may already have knowledge, try memory_query(scope: "*") to browse all entries.`,
             }],
           };
         }
@@ -1161,6 +1169,15 @@ function formatConflictWarning(conflicts: readonly ConflictPair[]): string {
     lines.push(`  - ${c.a.id}: "${c.a.title}" (confidence: ${c.a.confidence}, created: ${c.a.created.substring(0, 10)})`);
     lines.push(`    vs ${c.b.id}: "${c.b.title}" (confidence: ${c.b.confidence}, created: ${c.b.created.substring(0, 10)})`);
     lines.push(`    Similarity: ${(c.similarity * 100).toFixed(0)}%`);
+
+    // Guide the agent on which entry to trust
+    if (c.a.confidence !== c.b.confidence) {
+      const higher = c.a.confidence > c.b.confidence ? c.a : c.b;
+      lines.push(`    Higher confidence: ${higher.id} (${higher.confidence})`);
+    } else {
+      const newer = c.a.created > c.b.created ? c.a : c.b;
+      lines.push(`    More recent: ${newer.id} — may supersede the older entry`);
+    }
   }
   lines.push('');
   lines.push('Consider: memory_correct to consolidate or clarify the difference between these entries.');

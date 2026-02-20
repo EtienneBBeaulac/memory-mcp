@@ -10,13 +10,30 @@ import { promisify } from 'util';
 import type {
   MemoryEntry, TopicScope, TrustLevel, DetailLevel,
   QueryResult, QueryEntry, StoreResult, CorrectResult, MemoryStats,
-  BriefingResult, MemoryConfig, RelatedEntry, Clock, GitService,
+  BriefingResult, StaleEntry, ConflictPair, MemoryConfig, RelatedEntry, Clock, GitService,
 } from './types.js';
 import { DEFAULT_CONFIDENCE, realClock, parseTopicScope, parseTrustLevel } from './types.js';
+import {
+  DEDUP_SIMILARITY_THRESHOLD,
+  CONFLICT_SIMILARITY_THRESHOLD,
+  CONFLICT_MIN_CONTENT_CHARS,
+  PREFERENCE_SURFACE_THRESHOLD,
+  REFERENCE_BOOST_MULTIPLIER,
+  TOPIC_BOOST,
+  MODULE_TOPIC_BOOST,
+  USER_ALWAYS_INCLUDE_SCORE_FRACTION,
+  DEFAULT_STALE_DAYS_STANDARD,
+  DEFAULT_STALE_DAYS_PREFERENCES,
+  DEFAULT_MAX_STALE_IN_BRIEFING,
+  DEFAULT_MAX_DEDUP_SUGGESTIONS,
+  DEFAULT_MAX_CONFLICT_PAIRS,
+  DEFAULT_MAX_PREFERENCE_SUGGESTIONS,
+} from './thresholds.js';
 import { realGitService } from './git-service.js';
 import {
-  extractKeywords, similarity, matchesFilter, computeRelevanceScore,
+  extractKeywords, stem, similarity, matchesFilter, computeRelevanceScore,
 } from './text-analyzer.js';
+import { detectEphemeralSignals, formatEphemeralWarning } from './ephemeral.js';
 
 // Used only by bootstrap() for git log — not part of the GitService boundary
 // because bootstrap is a one-shot utility, not a recurring operation
@@ -37,6 +54,19 @@ export class MarkdownMemoryStore {
     this.git = config.git ?? realGitService;
   }
 
+  /** Resolved behavior thresholds — user config merged over defaults.
+   *  Centralizes threshold resolution so every caller gets the same value. */
+  private get behavior() {
+    const b = this.config.behavior ?? {};
+    return {
+      staleDaysStandard: b.staleDaysStandard ?? DEFAULT_STALE_DAYS_STANDARD,
+      staleDaysPreferences: b.staleDaysPreferences ?? DEFAULT_STALE_DAYS_PREFERENCES,
+      maxStaleInBriefing: b.maxStaleInBriefing ?? DEFAULT_MAX_STALE_IN_BRIEFING,
+      maxDedupSuggestions: b.maxDedupSuggestions ?? DEFAULT_MAX_DEDUP_SUGGESTIONS,
+      maxConflictPairs: b.maxConflictPairs ?? DEFAULT_MAX_CONFLICT_PAIRS,
+    };
+  }
+
   /** Initialize the store: create memory dir and load existing entries */
   async init(): Promise<void> {
     await fs.mkdir(this.memoryPath, { recursive: true });
@@ -49,7 +79,8 @@ export class MarkdownMemoryStore {
     title: string,
     content: string,
     sources: string[] = [],
-    trust: TrustLevel = 'agent-inferred'
+    trust: TrustLevel = 'agent-inferred',
+    references: string[] = [],
   ): Promise<StoreResult> {
     // Check storage budget — null means we can't measure, allow the write
     const currentSize = await this.getStorageSize();
@@ -70,7 +101,9 @@ export class MarkdownMemoryStore {
 
     const entry: MemoryEntry = {
       id, topic, title, content, confidence, trust,
-      sources, created: now, lastAccessed: now, gitSha, branch,
+      sources,
+      references: references.length > 0 ? references : undefined,
+      created: now, lastAccessed: now, gitSha, branch,
     };
 
     // Check for existing entry with same title in same topic (and same branch for recent-work)
@@ -98,8 +131,14 @@ export class MarkdownMemoryStore {
       ? this.findRelevantPreferences(entry)
       : undefined;
 
+    // Soft ephemeral detection — warn but never block
+    const ephemeralSignals = topic !== 'recent-work'
+      ? detectEphemeralSignals(title, content, topic)
+      : [];
+    const ephemeralWarning = formatEphemeralWarning(ephemeralSignals);
+
     return {
-      stored: true, id, topic, file, confidence, warning,
+      stored: true, id, topic, file, confidence, warning, ephemeralWarning,
       relatedEntries: relatedEntries.length > 0 ? relatedEntries : undefined,
       relevantPreferences: relevantPreferences && relevantPreferences.length > 0 ? relevantPreferences : undefined,
     };
@@ -258,7 +297,35 @@ export class MarkdownMemoryStore {
       ? `Last session context available for branch "${currentBranch}". Try memory_query(scope: "recent-work", detail: "full") for details.`
       : undefined;
 
-    return { briefing, entryCount: this.entries.size, staleEntries: staleCount, suggestion };
+    // Collect stale details for the presentation layer (index.ts) to format.
+    // Topic priority order: gotchas first (most dangerous when stale), then arch/conv/modules/recent-work.
+    // User is never stale; preferences use a 90-day threshold so they'll appear here only when truly old.
+    const STALE_TOPIC_PRIORITY: Record<string, number> = {
+      gotchas: 0, architecture: 1, conventions: 2, 'recent-work': 4,
+    };
+    const staleDetails: StaleEntry[] = allEntries
+      .filter(e => !this.isFresh(e))
+      .map(e => ({
+        id: e.id,
+        title: e.title,
+        topic: e.topic,
+        daysSinceAccess: Math.floor(this.daysSinceAccess(e)),
+      }))
+      .sort((a, b) => {
+        const pa = STALE_TOPIC_PRIORITY[a.topic] ?? (a.topic.startsWith('modules/') ? 3 : 5);
+        const pb = STALE_TOPIC_PRIORITY[b.topic] ?? (b.topic.startsWith('modules/') ? 3 : 5);
+        if (pa !== pb) return pa - pb;
+        return b.daysSinceAccess - a.daysSinceAccess; // older entries first within same priority
+      })
+      .slice(0, this.behavior.maxStaleInBriefing); // cap to avoid overwhelming the agent
+
+    return {
+      briefing,
+      entryCount: this.entries.size,
+      staleEntries: staleCount,
+      staleDetails: staleDetails.length > 0 ? staleDetails : undefined,
+      suggestion,
+    };
   }
 
   /** Correct an existing entry */
@@ -431,14 +498,7 @@ export class MarkdownMemoryStore {
     const currentBranch = branchFilter || await this.getCurrentBranch();
 
     // Topic boost factors — higher = more likely to surface
-    const topicBoost: Record<string, number> = {
-      'user': 2.0,
-      'preferences': 1.8,
-      'gotchas': 1.5,
-      'conventions': 1.2,
-      'architecture': 1.0,
-      'recent-work': 0.9,
-    };
+    const topicBoost = TOPIC_BOOST;
 
     const results: Array<{ entry: MemoryEntry; score: number; matchedKeywords: string[] }> = [];
 
@@ -461,10 +521,19 @@ export class MarkdownMemoryStore {
       const matchRatio = matchedKeywords.length / contextKeywords.size;
       if (matchRatio < minMatch) continue;
 
-      // Score = keyword match ratio x confidence x topic boost
-      const boost = topicBoost[entry.topic] ?? (entry.topic.startsWith('modules/') ? 1.1 : 1.0);
+      // Score = keyword match ratio x confidence x topic boost x reference boost
+      const boost = topicBoost[entry.topic] ?? (entry.topic.startsWith('modules/') ? MODULE_TOPIC_BOOST : 1.0);
       const freshnessMultiplier = this.isFresh(entry) ? 1.0 : 0.7;
-      const score = matchRatio * entry.confidence * boost * freshnessMultiplier;
+
+      // Reference boost: exact class/file name match in references gets a 1.3x multiplier.
+      // Extracts the basename (without extension) from each reference path and stems it,
+      // then checks for overlap with the context keywords.
+      const referenceBoost = entry.references?.some(ref => {
+        const basename = ref.split('/').pop()?.replace(/\.\w+$/, '') ?? ref;
+        return contextKeywords.has(stem(basename.toLowerCase()));
+      }) ? REFERENCE_BOOST_MULTIPLIER : 1.0;
+
+      const score = matchRatio * entry.confidence * boost * freshnessMultiplier * referenceBoost;
 
       results.push({ entry, score, matchedKeywords });
     }
@@ -472,7 +541,7 @@ export class MarkdownMemoryStore {
     // Always include user entries even if no keyword match (they're always relevant)
     for (const entry of this.entries.values()) {
       if (entry.topic === 'user' && !results.find(r => r.entry.id === entry.id)) {
-        results.push({ entry, score: entry.confidence * 0.5, matchedKeywords: [] });
+        results.push({ entry, score: entry.confidence * USER_ALWAYS_INCLUDE_SCORE_FRACTION, matchedKeywords: [] });
       }
     }
 
@@ -534,6 +603,9 @@ export class MarkdownMemoryStore {
     ];
     if (entry.sources.length > 0) {
       meta.push(`- **source**: ${entry.sources.join(', ')}`);
+    }
+    if (entry.references && entry.references.length > 0) {
+      meta.push(`- **references**: ${entry.references.join(', ')}`);
     }
     if (entry.gitSha) {
       meta.push(`- **gitSha**: ${entry.gitSha}`);
@@ -657,6 +729,10 @@ export class MarkdownMemoryStore {
     const rawConfidence = parseFloat(metadata['confidence'] ?? '0.7');
     const confidence = Math.max(0.0, Math.min(1.0, isNaN(rawConfidence) ? 0.7 : rawConfidence));
 
+    const references = metadata['references']
+      ? metadata['references'].split(',').map(s => s.trim()).filter(s => s.length > 0)
+      : undefined;
+
     return {
       id: metadata['id'],
       topic,
@@ -665,6 +741,7 @@ export class MarkdownMemoryStore {
       confidence,
       trust,
       sources: metadata['source'] ? metadata['source'].split(',').map(s => s.trim()) : [],
+      references: references && references.length > 0 ? references : undefined,
       created: metadata['created'] ?? now,
       lastAccessed: metadata['lastAccessed'] ?? now,
       gitSha: metadata['gitSha'],
@@ -686,12 +763,21 @@ export class MarkdownMemoryStore {
       fresh: this.isFresh(entry),
     };
 
+    if (detail === 'standard') {
+      return {
+        ...base,
+        // Surface references in standard detail — compact but useful for navigation
+        references: entry.references,
+      };
+    }
+
     if (detail === 'full') {
       return {
         ...base,
         content: entry.content,
         trust: entry.trust,
         sources: entry.sources,
+        references: entry.references,
         created: entry.created,
         lastAccessed: entry.lastAccessed,
         gitSha: entry.gitSha,
@@ -703,15 +789,27 @@ export class MarkdownMemoryStore {
   }
 
   private isFresh(entry: MemoryEntry): boolean {
-    const now = this.clock.now();
-    const thirtyDaysAgo = new Date(now.getTime());
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const lastAccessed = new Date(entry.lastAccessed);
+    // User identity never goes stale — name, role, employer change on a scale of years
+    if (entry.topic === 'user') return true;
 
-    // User info, preferences, gotchas, and user-trusted entries are always fresh
-    if (entry.topic === 'user' || entry.topic === 'preferences' || entry.topic === 'gotchas' || entry.trust === 'user') return true;
+    const daysSinceAccess = this.daysSinceAccess(entry);
+    const { staleDaysStandard, staleDaysPreferences } = this.behavior;
 
-    return lastAccessed > thirtyDaysAgo;
+    // Preferences evolve slowly — longer threshold to avoid noisy renewal nudges
+    if (entry.topic === 'preferences') return daysSinceAccess <= staleDaysPreferences;
+
+    // Everything else (including gotchas) uses the standard threshold.
+    // Gotchas are deliberately NOT exempt: code changes make them the most dangerous when stale.
+    // Trust level does NOT grant freshness exemption — trust reflects source quality at write time,
+    // not temporal validity. A user-confirmed entry from 6 months ago can still be outdated.
+    return daysSinceAccess <= staleDaysStandard;
+  }
+
+  /** Days elapsed since entry was last accessed */
+  private daysSinceAccess(entry: MemoryEntry): number {
+    const now = this.clock.now().getTime();
+    const lastAccessed = new Date(entry.lastAccessed).getTime();
+    return (now - lastAccessed) / (1000 * 60 * 60 * 24);
   }
 
   private summarize(text: string, maxChars: number): string {
@@ -751,7 +849,7 @@ export class MarkdownMemoryStore {
   // --- Dedup and preference surfacing ---
 
   /** Find entries in the same topic with significant overlap (dedup detection).
-   *  Uses hybrid jaccard+containment with 0.35 threshold. */
+   *  Uses hybrid jaccard+containment similarity. */
   private findRelatedEntries(newEntry: MemoryEntry, excludeId?: string): RelatedEntry[] {
     const related: Array<{ entry: MemoryEntry; similarity: number }> = [];
 
@@ -765,14 +863,14 @@ export class MarkdownMemoryStore {
         entry.title, entry.content,
       );
 
-      if (sim > 0.35) {
+      if (sim > DEDUP_SIMILARITY_THRESHOLD) {
         related.push({ entry, similarity: sim });
       }
     }
 
     return related
       .sort((a, b) => b.similarity - a.similarity)
-      .slice(0, 3)
+      .slice(0, this.behavior.maxDedupSuggestions)
       .map(r => ({
         id: r.entry.id,
         title: r.entry.title,
@@ -782,8 +880,56 @@ export class MarkdownMemoryStore {
       }));
   }
 
+  /** Fetch raw MemoryEntry objects by ID for conflict detection.
+   *  Must be called after query() (which calls reloadFromDisk) to ensure entries are current. */
+  getEntriesByIds(ids: readonly string[]): MemoryEntry[] {
+    return ids.flatMap(id => {
+      const entry = this.entries.get(id);
+      return entry ? [entry] : [];
+    });
+  }
+
+  /** Detect potential conflicts in a result set — lazy, high-signal, never background.
+   *  Compares all pairs from the given entries using similarity().
+   *  Only flags pairs where both entries have substantive content (>50 chars) and
+   *  similarity exceeds 0.6. Returns at most 2 pairs to avoid overwhelming the agent.
+   *
+   *  Accepts a minimal shape so it works with both MemoryEntry and QueryEntry (full detail). */
+  detectConflicts(entries: readonly Pick<MemoryEntry, 'id' | 'title' | 'content' | 'confidence' | 'created'>[]): ConflictPair[] {
+    type Scored = { pair: ConflictPair; score: number };
+    const conflicts: Scored[] = [];
+
+    for (let i = 0; i < entries.length; i++) {
+      for (let j = i + 1; j < entries.length; j++) {
+        const a = entries[i];
+        const b = entries[j];
+
+        // Skip entries with trivially short content — similarity on short text is noisy
+        if (a.content.length <= CONFLICT_MIN_CONTENT_CHARS || b.content.length <= CONFLICT_MIN_CONTENT_CHARS) continue;
+
+        const score = similarity(a.title, a.content, b.title, b.content);
+        if (score > CONFLICT_SIMILARITY_THRESHOLD) {
+          conflicts.push({
+            pair: {
+              a: { id: a.id, title: a.title, confidence: a.confidence, created: a.created },
+              b: { id: b.id, title: b.title, confidence: b.confidence, created: b.created },
+              similarity: score,
+            },
+            score,
+          });
+        }
+      }
+    }
+
+    // Surface highest-similarity conflicts first, cap per behavior config
+    return conflicts
+      .sort((x, y) => y.score - x.score)
+      .slice(0, this.behavior.maxConflictPairs)
+      .map(c => c.pair);
+  }
+
   /** Find preferences relevant to a given entry (cross-topic overlap).
-   *  Lower threshold (0.2) since preferences are always worth surfacing. */
+   *  Lower threshold than dedup since preferences are always worth surfacing. */
   private findRelevantPreferences(entry: MemoryEntry): RelatedEntry[] {
     const relevant: Array<{ entry: MemoryEntry; similarity: number }> = [];
 
@@ -795,14 +941,14 @@ export class MarkdownMemoryStore {
         pref.title, pref.content,
       );
 
-      if (sim > 0.2) {
+      if (sim > PREFERENCE_SURFACE_THRESHOLD) {
         relevant.push({ entry: pref, similarity: sim });
       }
     }
 
     return relevant
       .sort((a, b) => b.similarity - a.similarity)
-      .slice(0, 3)
+      .slice(0, DEFAULT_MAX_PREFERENCE_SUGGESTIONS)
       .map(r => ({
         id: r.entry.id,
         title: r.entry.title,

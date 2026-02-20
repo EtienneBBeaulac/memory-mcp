@@ -126,63 +126,95 @@ describe('Clock injection for freshness', () => {
     assert.strictEqual(result.entries[0].fresh, true, 'Entry should be fresh within 30 days');
   });
 
-  it('user and preference entries are always fresh regardless of age', async () => {
+  it('user topic entries are always fresh regardless of age', async () => {
     const jan1 = fakeClock('2025-01-01T00:00:00.000Z');
     const store1 = new MarkdownMemoryStore(makeConfig(tempDir, jan1));
     await store1.init();
 
     await store1.store('user', 'Identity', 'An engineer', [], 'user');
-    await store1.store('preferences', 'Style', 'Functional first', [], 'user');
 
-    // Query 1 year later
+    // Query 1 year later — user topic is exempt
     const nextYear = fakeClock('2026-01-01T00:00:00.000Z');
     const store2 = new MarkdownMemoryStore(makeConfig(tempDir, nextYear));
     await store2.init();
 
-    const result = await store2.query('*', 'brief');
-    for (const entry of result.entries) {
-      assert.strictEqual(entry.fresh, true, `"${entry.title}" should be always-fresh`);
+    const result = await store2.query('user', 'brief');
+    assert.strictEqual(result.entries[0].fresh, true, 'User topic should always be fresh');
+  });
+
+  it('preferences entries are stale after 90 days, fresh before', async () => {
+    // Use separate temp dirs to prevent query() from refreshing lastAccessed between scenarios
+    const dir60 = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-pref-60-'));
+    const dir100 = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-pref-100-'));
+
+    try {
+      const jan1 = fakeClock('2025-01-01T00:00:00.000Z');
+
+      // Scenario 1: written Jan 1, queried Mar 2 (60 days) — should be fresh
+      const write60 = new MarkdownMemoryStore(makeConfig(dir60, jan1));
+      await write60.init();
+      await write60.store('preferences', 'Style', 'Functional first', [], 'user');
+      const mar2 = fakeClock('2025-03-02T00:00:00.000Z'); // ~60 days later
+      const read60 = new MarkdownMemoryStore(makeConfig(dir60, mar2));
+      await read60.init();
+      const result60 = await read60.query('preferences', 'brief');
+      assert.strictEqual(result60.entries[0].fresh, true, 'Preference at 60 days should still be fresh (within 90-day window)');
+
+      // Scenario 2: written Jan 1, queried Apr 11 (100 days) — should be stale
+      const write100 = new MarkdownMemoryStore(makeConfig(dir100, jan1));
+      await write100.init();
+      await write100.store('preferences', 'Style', 'Functional first', [], 'user');
+      const apr11 = fakeClock('2025-04-11T00:00:00.000Z'); // ~100 days later
+      const read100 = new MarkdownMemoryStore(makeConfig(dir100, apr11));
+      await read100.init();
+      const result100 = await read100.query('preferences', 'brief');
+      assert.strictEqual(result100.entries[0].fresh, false, 'Preference at 100 days should be stale (exceeds 90-day window)');
+    } finally {
+      await fs.rm(dir60, { recursive: true, force: true }).catch(() => {});
+      await fs.rm(dir100, { recursive: true, force: true }).catch(() => {});
     }
   });
 
-  it('gotchas are always fresh regardless of age', async () => {
+  it('gotchas go stale after 30 days (not always-fresh)', async () => {
     const jan1 = fakeClock('2025-01-01T00:00:00.000Z');
     const store1 = new MarkdownMemoryStore(makeConfig(tempDir, jan1));
     await store1.init();
 
     await store1.store('gotchas', 'Build Gotcha', 'Always clean build', [], 'agent-inferred');
 
+    // Query 1 year later — gotchas are NOT exempt from staleness
     const nextYear = fakeClock('2026-01-01T00:00:00.000Z');
     const store2 = new MarkdownMemoryStore(makeConfig(tempDir, nextYear));
     await store2.init();
 
     const result = await store2.query('gotchas', 'brief');
-    assert.strictEqual(result.entries[0].fresh, true, 'Gotchas should be always-fresh');
+    assert.strictEqual(result.entries[0].fresh, false, 'Gotchas should go stale after 30 days — code changes make them the most dangerous when outdated');
   });
 
-  it('user-trusted entries are always fresh regardless of age', async () => {
+  it('user-trusted entries in non-user topics go stale normally (trust != temporal validity)', async () => {
     const jan1 = fakeClock('2025-01-01T00:00:00.000Z');
     const store1 = new MarkdownMemoryStore(makeConfig(tempDir, jan1));
     await store1.init();
 
-    await store1.store('conventions', 'User Convention', 'User said so', [], 'user');
+    await store1.store('conventions', 'User Convention', 'User confirmed this', [], 'user');
 
+    // Query 1 year later — trust level does not grant freshness exemption
     const nextYear = fakeClock('2026-01-01T00:00:00.000Z');
     const store2 = new MarkdownMemoryStore(makeConfig(tempDir, nextYear));
     await store2.init();
 
     const result = await store2.query('conventions', 'brief');
-    assert.strictEqual(result.entries[0].fresh, true, 'User-trusted entries should be always-fresh');
+    assert.strictEqual(result.entries[0].fresh, false, 'Trust level does not grant freshness exemption — a user-confirmed entry can still be outdated');
   });
 
-  it('stale count in briefing reflects clock-based freshness', async () => {
+  it('stale count in briefing reflects tiered thresholds', async () => {
     const jan1 = fakeClock('2025-01-01T00:00:00.000Z');
     const store1 = new MarkdownMemoryStore(makeConfig(tempDir, jan1));
     await store1.init();
 
     await store1.store('architecture', 'Old Arch', 'content', [], 'agent-inferred');
     await store1.store('conventions', 'Old Conv', 'content', [], 'agent-confirmed');
-    await store1.store('gotchas', 'Gotcha', 'content', [], 'agent-inferred'); // always fresh
+    await store1.store('gotchas', 'Gotcha', 'content', [], 'agent-inferred'); // stale after 30 days
 
     // Briefing 60 days later
     const mar2 = fakeClock('2025-03-02T00:00:00.000Z');
@@ -190,8 +222,8 @@ describe('Clock injection for freshness', () => {
     await store2.init();
 
     const briefing = await store2.briefing(2000);
-    // arch + conv are stale (agent-inferred/confirmed, >30 days), gotcha is always-fresh
-    assert.strictEqual(briefing.staleEntries, 2, 'Should have 2 stale entries');
+    // arch + conv + gotcha are all stale at 60 days (all use 30-day threshold)
+    assert.strictEqual(briefing.staleEntries, 3, 'arch, conv, and gotcha should all be stale at 60 days');
   });
 
   it('clock is used for created/lastAccessed timestamps', async () => {

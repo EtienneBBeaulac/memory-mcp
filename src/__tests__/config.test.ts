@@ -9,7 +9,7 @@ import assert from 'node:assert';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
-import { getLobeConfigs } from '../config.js';
+import { getLobeConfigs, parseBehaviorConfig } from '../config.js';
 
 // Save original env vars so we can restore after each test
 const originalEnv: Record<string, string | undefined> = {};
@@ -155,6 +155,103 @@ describe('getLobeConfigs', () => {
         assert.ok(config.memoryPath.includes('.custom-memory'),
           `Should use custom dir: ${config.memoryPath}`);
       }
+    });
+  });
+
+  describe('behavior config parsing', () => {
+    it('returns empty object when no behavior block provided', () => {
+      const result = parseBehaviorConfig(undefined);
+      // All fields should be absent (caller falls back to defaults from thresholds.ts)
+      assert.strictEqual(Object.keys(result).length, 0);
+    });
+
+    it('passes through valid values within allowed ranges', () => {
+      const result = parseBehaviorConfig({
+        staleDaysStandard: 14,
+        staleDaysPreferences: 60,
+        maxStaleInBriefing: 3,
+        maxDedupSuggestions: 5,
+        maxConflictPairs: 2,
+      });
+      assert.strictEqual(result.staleDaysStandard, 14);
+      assert.strictEqual(result.staleDaysPreferences, 60);
+      assert.strictEqual(result.maxStaleInBriefing, 3);
+      assert.strictEqual(result.maxDedupSuggestions, 5);
+      assert.strictEqual(result.maxConflictPairs, 2);
+    });
+
+    it('falls back to default for out-of-range staleDaysStandard', () => {
+      const tooLow = parseBehaviorConfig({ staleDaysStandard: 0 });
+      assert.strictEqual(tooLow.staleDaysStandard, 30, 'Should use default 30 for value below minimum (1)');
+
+      const tooHigh = parseBehaviorConfig({ staleDaysStandard: 500 });
+      assert.strictEqual(tooHigh.staleDaysStandard, 30, 'Should use default 30 for value above maximum (365)');
+    });
+
+    it('falls back to default for out-of-range staleDaysPreferences', () => {
+      const tooHigh = parseBehaviorConfig({ staleDaysPreferences: 800 });
+      assert.strictEqual(tooHigh.staleDaysPreferences, 90, 'Should use default 90 for value above maximum (730)');
+    });
+
+    it('falls back to default for out-of-range maxStaleInBriefing', () => {
+      const tooHigh = parseBehaviorConfig({ maxStaleInBriefing: 50 });
+      assert.strictEqual(tooHigh.maxStaleInBriefing, 5, 'Should use default 5 for value above maximum (20)');
+    });
+
+    it('falls back to default for out-of-range maxConflictPairs', () => {
+      const tooHigh = parseBehaviorConfig({ maxConflictPairs: 10 });
+      assert.strictEqual(tooHigh.maxConflictPairs, 2, 'Should use default 2 for value above maximum (5)');
+    });
+
+    it('rounds fractional values to integers', () => {
+      const result = parseBehaviorConfig({ staleDaysStandard: 14.7 });
+      assert.strictEqual(result.staleDaysStandard, 15, 'Should round to nearest integer');
+    });
+
+    it('handles partial behavior config — omitted fields do not appear', () => {
+      const result = parseBehaviorConfig({ staleDaysStandard: 14 });
+      assert.strictEqual(result.staleDaysStandard, 14);
+      // Omitted fields should not be set (callers use thresholds.ts defaults)
+      assert.strictEqual(result.staleDaysPreferences, 90, 'Non-omitted field uses default');
+    });
+
+    it('writes a stderr warning for unknown behavior config keys (typo detection)', () => {
+      const stderrWrites: string[] = [];
+      const origWrite = process.stderr.write.bind(process.stderr);
+      // Capture stderr
+      process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+        if (typeof chunk === 'string') stderrWrites.push(chunk);
+        return origWrite(chunk as never, ...(rest as never[]));
+      }) as typeof process.stderr.write;
+
+      try {
+        // "staleDaysStanderd" is a typo of "staleDaysStandard"
+        parseBehaviorConfig({ staleDaysStandard: 14, staleDaysStanderd: 7 } as never);
+      } finally {
+        process.stderr.write = origWrite;
+      }
+
+      const warnings = stderrWrites.filter(s => s.includes('Unknown behavior config key'));
+      assert.ok(warnings.length > 0, 'Should warn about unknown key "staleDaysStanderd"');
+      assert.ok(warnings[0]!.includes('staleDaysStanderd'), 'Warning should name the offending key');
+    });
+
+    it('does not warn for valid behavior config keys', () => {
+      const stderrWrites: string[] = [];
+      const origWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+        if (typeof chunk === 'string') stderrWrites.push(chunk);
+        return origWrite(chunk as never, ...(rest as never[]));
+      }) as typeof process.stderr.write;
+
+      try {
+        parseBehaviorConfig({ staleDaysStandard: 14, maxStaleInBriefing: 3 });
+      } finally {
+        process.stderr.write = origWrite;
+      }
+
+      const unknownWarnings = stderrWrites.filter(s => s.includes('Unknown behavior config key'));
+      assert.strictEqual(unknownWarnings.length, 0, 'Should not warn for valid keys');
     });
   });
 
