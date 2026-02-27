@@ -8,11 +8,11 @@ import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import type {
-  MemoryEntry, TopicScope, TrustLevel, DetailLevel,
+  MemoryEntry, TopicScope, TrustLevel, DetailLevel, Tag,
   QueryResult, QueryEntry, StoreResult, CorrectResult, MemoryStats,
   BriefingResult, StaleEntry, ConflictPair, MemoryConfig, RelatedEntry, Clock, GitService,
 } from './types.js';
-import { DEFAULT_CONFIDENCE, realClock, parseTopicScope, parseTrustLevel } from './types.js';
+import { DEFAULT_CONFIDENCE, realClock, parseTopicScope, parseTrustLevel, parseTags } from './types.js';
 import {
   DEDUP_SIMILARITY_THRESHOLD,
   CONFLICT_SIMILARITY_THRESHOLD_SAME_TOPIC,
@@ -30,6 +30,7 @@ import {
   DEFAULT_MAX_DEDUP_SUGGESTIONS,
   DEFAULT_MAX_CONFLICT_PAIRS,
   DEFAULT_MAX_PREFERENCE_SUGGESTIONS,
+  TAG_MATCH_BOOST,
 } from './thresholds.js';
 import { realGitService } from './git-service.js';
 import {
@@ -83,6 +84,7 @@ export class MarkdownMemoryStore {
     sources: string[] = [],
     trust: TrustLevel = 'agent-inferred',
     references: string[] = [],
+    rawTags: string[] = [],
   ): Promise<StoreResult> {
     // Check storage budget — null means we can't measure, allow the write
     const currentSize = await this.getStorageSize();
@@ -101,10 +103,14 @@ export class MarkdownMemoryStore {
     // Auto-detect branch for recent-work entries
     const branch = topic === 'recent-work' ? await this.getCurrentBranch() : undefined;
 
+    // Validate tags at boundary — invalid ones silently dropped
+    const tags = parseTags(rawTags);
+
     const entry: MemoryEntry = {
       id, topic, title, content, confidence, trust,
       sources,
       references: references.length > 0 ? references : undefined,
+      tags: tags.length > 0 ? tags : undefined,
       created: now, lastAccessed: now, gitSha, branch,
     };
 
@@ -175,12 +181,12 @@ export class MarkdownMemoryStore {
         }
       }
 
-      // Optional keyword filter with AND/OR/NOT syntax
+      // Optional keyword filter with AND/OR/NOT syntax + #tag and =exact support
       if (filter) {
         const titleKeywords = extractKeywords(entry.title);
         const contentKeywords = extractKeywords(entry.content);
         const allKeywords = new Set([...titleKeywords, ...contentKeywords]);
-        return matchesFilter(allKeywords, filter);
+        return matchesFilter(allKeywords, filter, entry.tags);
       }
       return true;
     });
@@ -194,6 +200,7 @@ export class MarkdownMemoryStore {
           extractKeywords(entry.content),
           entry.confidence,
           filter,
+          entry.tags,
         ));
       }
       matching.sort((a, b) => {
@@ -221,7 +228,7 @@ export class MarkdownMemoryStore {
     const entries: QueryEntry[] = matching.map(entry => ({
       ...this.formatEntry(entry, detail),
       relevanceScore: filter
-        ? computeRelevanceScore(extractKeywords(entry.title), extractKeywords(entry.content), entry.confidence, filter)
+        ? computeRelevanceScore(extractKeywords(entry.title), extractKeywords(entry.content), entry.confidence, filter, entry.tags)
         : entry.confidence,
     }));
 
@@ -381,6 +388,7 @@ export class MarkdownMemoryStore {
     const byTopic: Record<string, number> = {};
     const byTrust: Record<TrustLevel, number> = { 'user': 0, 'agent-confirmed': 0, 'agent-inferred': 0 };
     const byFreshness = { fresh: 0, stale: 0, unknown: 0 };
+    const byTag: Record<string, number> = {};
 
     for (const entry of allEntries) {
       byTopic[entry.topic] = (byTopic[entry.topic] ?? 0) + 1;
@@ -392,6 +400,12 @@ export class MarkdownMemoryStore {
       } else {
         byFreshness.stale++;
       }
+      // Aggregate tag frequencies
+      if (entry.tags) {
+        for (const tag of entry.tags) {
+          byTag[tag] = (byTag[tag] ?? 0) + 1;
+        }
+      }
     }
 
     const dates = allEntries.map(e => e.created).sort();
@@ -399,7 +413,7 @@ export class MarkdownMemoryStore {
     return {
       totalEntries: allEntries.length,
       corruptFiles: this.corruptFileCount,
-      byTopic, byTrust, byFreshness,
+      byTopic, byTrust, byFreshness, byTag,
       storageSize: this.formatBytes(storageSize ?? 0),
       storageBudgetBytes: this.config.storageBudgetBytes,
       memoryPath: this.memoryPath,
@@ -531,7 +545,9 @@ export class MarkdownMemoryStore {
         continue;
       }
 
-      const entryKeywords = extractKeywords(`${entry.title} ${entry.content}`);
+      // Include tag values as keywords so tagged entries surface in context search
+      const tagKeywordPart = entry.tags ? ` ${entry.tags.join(' ')}` : '';
+      const entryKeywords = extractKeywords(`${entry.title} ${entry.content}${tagKeywordPart}`);
       const matchedKeywords: string[] = [];
 
       for (const kw of contextKeywords) {
@@ -556,7 +572,11 @@ export class MarkdownMemoryStore {
         return contextKeywords.has(stem(basename.toLowerCase()));
       }) ? REFERENCE_BOOST_MULTIPLIER : 1.0;
 
-      const score = matchRatio * entry.confidence * boost * freshnessMultiplier * referenceBoost;
+      // Tag boost: if any tag exactly matches a context keyword, boost the entry
+      const tagBoost = entry.tags?.some(tag => contextKeywords.has(tag))
+        ? TAG_MATCH_BOOST : 1.0;
+
+      const score = matchRatio * entry.confidence * boost * freshnessMultiplier * referenceBoost * tagBoost;
 
       results.push({ entry, score, matchedKeywords });
     }
@@ -629,6 +649,9 @@ export class MarkdownMemoryStore {
     }
     if (entry.references && entry.references.length > 0) {
       meta.push(`- **references**: ${entry.references.join(', ')}`);
+    }
+    if (entry.tags && entry.tags.length > 0) {
+      meta.push(`- **tags**: ${entry.tags.join(', ')}`);
     }
     if (entry.gitSha) {
       meta.push(`- **gitSha**: ${entry.gitSha}`);
@@ -756,6 +779,11 @@ export class MarkdownMemoryStore {
       ? metadata['references'].split(',').map(s => s.trim()).filter(s => s.length > 0)
       : undefined;
 
+    // Parse tags at boundary — invalid tags silently dropped
+    const tags = metadata['tags']
+      ? parseTags(metadata['tags'].split(','))
+      : undefined;
+
     return {
       id: metadata['id'],
       topic,
@@ -765,6 +793,7 @@ export class MarkdownMemoryStore {
       trust,
       sources: metadata['source'] ? metadata['source'].split(',').map(s => s.trim()) : [],
       references: references && references.length > 0 ? references : undefined,
+      tags: tags && tags.length > 0 ? tags : undefined,
       created: metadata['created'] ?? now,
       lastAccessed: metadata['lastAccessed'] ?? now,
       gitSha: metadata['gitSha'],
@@ -789,8 +818,9 @@ export class MarkdownMemoryStore {
     if (detail === 'standard') {
       return {
         ...base,
-        // Surface references in standard detail — compact but useful for navigation
+        // Surface references and tags in standard detail
         references: entry.references,
+        tags: entry.tags,
       };
     }
 
@@ -801,6 +831,7 @@ export class MarkdownMemoryStore {
         trust: entry.trust,
         sources: entry.sources,
         references: entry.references,
+        tags: entry.tags,
         created: entry.created,
         lastAccessed: entry.lastAccessed,
         gitSha: entry.gitSha,
@@ -901,6 +932,19 @@ export class MarkdownMemoryStore {
         confidence: r.entry.confidence,
         trust: r.entry.trust,
       }));
+  }
+
+  /** Tag frequency across all entries — for vocabulary echo in store responses.
+   *  Returns tags sorted by frequency (descending). O(N) over entries. */
+  getTagFrequency(): ReadonlyMap<string, number> {
+    const freq = new Map<string, number>();
+    for (const entry of this.entries.values()) {
+      if (!entry.tags) continue;
+      for (const tag of entry.tags) {
+        freq.set(tag, (freq.get(tag) ?? 0) + 1);
+      }
+    }
+    return freq;
   }
 
   /** Fetch raw MemoryEntry objects by ID for conflict detection.

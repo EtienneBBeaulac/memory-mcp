@@ -27,6 +27,42 @@ export type TopicScope =
 
 const FIXED_TOPICS: readonly string[] = ['user', 'preferences', 'architecture', 'conventions', 'gotchas', 'recent-work'];
 
+/** Validated tag: lowercase alphanumeric slug (letters, digits, hyphens).
+ *  Branded type prevents accidentally passing raw strings where validated tags are expected. */
+export type Tag = string & { readonly __brand: 'Tag' };
+
+const TAG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const MAX_TAG_LENGTH = 50;
+const MAX_TAGS_PER_ENTRY = 10;
+
+/** Parse a raw string into a Tag, returning null for invalid input.
+ *  Normalizes to lowercase. Rejects empty, too-long, or non-slug strings. */
+export function parseTag(raw: string): Tag | null {
+  const normalized = raw.trim().toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')  // non-slug chars → dash
+    .replace(/-+/g, '-')           // collapse consecutive dashes
+    .replace(/^-|-$/g, '');        // trim leading/trailing dashes
+  if (normalized.length < 2 || normalized.length > MAX_TAG_LENGTH) return null;
+  if (!TAG_PATTERN.test(normalized)) return null;
+  return normalized as Tag;
+}
+
+/** Parse an array of raw strings into Tags, silently dropping invalid/duplicate ones.
+ *  Caps at MAX_TAGS_PER_ENTRY to prevent sprawl. */
+export function parseTags(raw: readonly string[]): readonly Tag[] {
+  const tags: Tag[] = [];
+  const seen = new Set<string>();
+  for (const r of raw) {
+    const tag = parseTag(r);
+    if (tag && !seen.has(tag)) {
+      seen.add(tag);
+      tags.push(tag);
+    }
+    if (tags.length >= MAX_TAGS_PER_ENTRY) break;
+  }
+  return tags;
+}
+
 /** Parse a raw string into a TopicScope, returning null for invalid input */
 export function parseTopicScope(raw: string): TopicScope | null {
   if (FIXED_TOPICS.includes(raw)) return raw as TopicScope;
@@ -56,6 +92,7 @@ export interface MemoryEntry {
   readonly trust: TrustLevel;
   readonly sources: readonly string[]; // file paths that informed this (provenance)
   readonly references?: readonly string[]; // semantic pointers — files/classes this entry is about
+  readonly tags?: readonly Tag[];      // user-defined labels for exact-match retrieval
   readonly created: string;           // ISO 8601
   readonly lastAccessed: string;      // ISO 8601
   readonly gitSha?: string;           // SHA of source files at write time
@@ -95,6 +132,7 @@ export interface QueryEntry {
   readonly fresh: boolean;
   // In 'standard' and 'full' detail
   readonly references?: readonly string[];
+  readonly tags?: readonly Tag[];
   // Only in 'full' detail
   readonly content?: string;
   readonly trust?: TrustLevel;
@@ -156,6 +194,7 @@ export interface MemoryStats {
   readonly byTopic: Record<string, number>;
   readonly byTrust: Record<TrustLevel, number>;
   readonly byFreshness: { fresh: number; stale: number; unknown: number };
+  readonly byTag: Record<string, number>;
   readonly storageSize: string;
   readonly storageBudgetBytes: number;
   readonly memoryPath: string;

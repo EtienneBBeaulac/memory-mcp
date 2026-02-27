@@ -20,6 +20,10 @@ const PARAM_ALIASES: Record<string, string> = {
   // memory_context aliases
   description: 'context',
   task: 'context',
+  // tag aliases
+  tag: 'tags',
+  labels: 'tags',
+  categories: 'tags',
   // lobe aliases
   workspace: 'lobe',
   repo: 'lobe',

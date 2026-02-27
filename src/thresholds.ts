@@ -101,3 +101,12 @@ export const DEFAULT_MAX_CONFLICT_PAIRS = 2;
 
 /** Maximum related preferences surfaced when storing a non-preference entry. */
 export const DEFAULT_MAX_PREFERENCE_SUGGESTIONS = 3;
+
+/** Score multiplier when an entry's tags match context keywords in contextSearch(). */
+export const TAG_MATCH_BOOST = 1.5;
+
+/** Maximum tags shown in vocabulary echo after a store operation. */
+export const VOCABULARY_ECHO_LIMIT = 8;
+
+/** Maximum tags shown in query/context footer. */
+export const MAX_FOOTER_TAGS = 12;
