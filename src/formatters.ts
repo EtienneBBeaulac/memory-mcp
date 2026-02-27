@@ -7,7 +7,10 @@ import type { MemoryStats, StaleEntry, ConflictPair, BehaviorConfig } from './ty
 import {
   DEFAULT_STALE_DAYS_STANDARD, DEFAULT_STALE_DAYS_PREFERENCES,
   DEFAULT_MAX_STALE_IN_BRIEFING, DEFAULT_MAX_DEDUP_SUGGESTIONS, DEFAULT_MAX_CONFLICT_PAIRS,
+  MAX_FOOTER_TAGS,
 } from './thresholds.js';
+import { analyzeFilterGroups, type FilterGroup, type QueryMode } from './text-analyzer.js';
+import type { MarkdownMemoryStore } from './store.js';
 
 /** Format the stale entries section for briefing/context responses */
 export function formatStaleSection(staleDetails: readonly StaleEntry[]): string {
@@ -53,6 +56,13 @@ export function formatStats(lobe: string, result: MemoryStats): string {
     .map(([trust, count]) => `  - ${trust}: ${count}`)
     .join('\n');
 
+  const tagLines = Object.entries(result.byTag).length > 0
+    ? Object.entries(result.byTag)
+        .sort((a, b) => b[1] - a[1])
+        .map(([tag, count]) => `  - ${tag}: ${count}`)
+        .join('\n')
+    : '  (none)';
+
   const corruptLine = result.corruptFiles > 0 ? `\n**Corrupt files:** ${result.corruptFiles}` : '';
 
   return [
@@ -67,6 +77,9 @@ export function formatStats(lobe: string, result: MemoryStats): string {
     ``,
     `### By Trust Level`,
     trustLines,
+    ``,
+    `### By Tag`,
+    tagLines,
     ``,
     `### Freshness`,
     `  - Fresh: ${result.byFreshness.fresh}`,
@@ -106,4 +119,98 @@ export function formatBehaviorConfigSection(behavior?: BehaviorConfig): string {
   }
 
   return lines.join('\n');
+}
+
+/** Merge tag frequencies from multiple stores — pure function over a collection */
+export function mergeTagFrequencies(
+  stores: Iterable<MarkdownMemoryStore>,
+): ReadonlyMap<string, number> {
+  const merged = new Map<string, number>();
+  
+  for (const store of stores) {
+    const freq = store.getTagFrequency();
+    for (const [tag, count] of freq) {
+      merged.set(tag, (merged.get(tag) ?? 0) + count);
+    }
+  }
+  
+  return merged;
+}
+
+/** Build query footer — pure function, same inputs → same output.
+ *  Accepts parsed FilterGroup[] to avoid reparsing. */
+export function buildQueryFooter(opts: {
+  readonly filterGroups: readonly FilterGroup[];
+  readonly rawFilter: string | undefined;
+  readonly tagFreq: ReadonlyMap<string, number>;
+  readonly resultCount: number;
+  readonly scope: string;
+}): string {
+  const { filterGroups, rawFilter, tagFreq, resultCount, scope } = opts;
+  const mode = analyzeFilterGroups(filterGroups);
+  const lines: string[] = [];
+  
+  // 1. Query mode explanation
+  switch (mode.kind) {
+    case 'no-filter':
+      lines.push(`Showing all entries in scope "${scope}"`);
+      break;
+    case 'keyword-only':
+      lines.push(`Searched keywords: ${mode.terms.join(', ')} (stemmed)`);
+      break;
+    case 'tag-only':
+      lines.push(`Filtered by tags: ${mode.tags.map(t => `#${t}`).join(', ')} (exact match)`);
+      break;
+    case 'complex':
+      const features: string[] = [];
+      if (mode.hasTags) features.push('#tags');
+      if (mode.hasExact) features.push('=exact');
+      if (mode.hasNot) features.push('-NOT');
+      if (mode.hasOr) features.push('|OR');
+      lines.push(`Complex filter: ${features.join(', ')}`);
+      break;
+  }
+  
+  // 2. Available tags (always shown, capped for readability)
+  if (tagFreq.size > 0) {
+    const topTags = [...tagFreq.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, MAX_FOOTER_TAGS)
+      .map(([tag, count]) => `${tag}(${count})`)
+      .join(', ');
+    const remainder = tagFreq.size > MAX_FOOTER_TAGS ? ` + ${tagFreq.size - MAX_FOOTER_TAGS} more` : '';
+    lines.push(`Available tags: ${topTags}${remainder}`);
+  }
+  
+  // 3. Zero-results suggestion (adaptive) — only when using keywords and tags exist
+  if (resultCount === 0 && mode.kind === 'keyword-only' && tagFreq.size > 0) {
+    const topTag = [...tagFreq.entries()].sort((a, b) => b[1] - a[1])[0][0];
+    lines.push(`→ No keyword matches. Try: filter: "#${topTag}" for exact category.`);
+  }
+  
+  // 4. Syntax reference — show on failure or complex queries (not on simple successful queries)
+  if (resultCount === 0 || mode.kind === 'complex') {
+    lines.push(`Syntax: #tag | =exact | -NOT | word (stemmed) | A B (AND) | A|B (OR)`);
+  }
+  
+  return lines.join('\n');
+}
+
+/** Build tag primer section for session briefing — pure function */
+export function buildTagPrimerSection(tagFreq: ReadonlyMap<string, number>): string {
+  if (tagFreq.size === 0) return '';
+  
+  const allTags = [...tagFreq.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([tag, count]) => `${tag}(${count})`)
+    .join(', ');
+  
+  return [
+    `### Tag Vocabulary (${tagFreq.size} tags)`,
+    allTags,
+    ``,
+    `Filter by tags: memory_query(filter: "#auth") — exact match`,
+    `Combine: memory_query(filter: "#auth middleware") — tag + keyword`,
+    `Multiple: memory_query(filter: "#auth|#security") — OR logic`,
+  ].join('\n');
 }

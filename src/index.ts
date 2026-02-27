@@ -17,7 +17,7 @@ import { existsSync, writeFileSync } from 'fs';
 import { readFile, writeFile } from 'fs/promises';
 import { MarkdownMemoryStore } from './store.js';
 import type { DetailLevel, TopicScope, TrustLevel } from './types.js';
-import { DEFAULT_STORAGE_BUDGET_BYTES, parseTopicScope, parseTrustLevel } from './types.js';
+import { DEFAULT_STORAGE_BUDGET_BYTES, parseTopicScope, parseTrustLevel, parseTags } from './types.js';
 import { getLobeConfigs, type ConfigOrigin } from './config.js';
 import { ConfigManager } from './config-manager.js';
 import { normalizeArgs } from './normalize.js';
@@ -26,9 +26,9 @@ import {
   readCrashHistory, clearLatestCrash, formatCrashReport, formatCrashSummary,
   markServerStarted, type CrashContext, type CrashReport,
 } from './crash-journal.js';
-import { formatStaleSection, formatConflictWarning, formatStats, formatBehaviorConfigSection } from './formatters.js';
-import { extractKeywords } from './text-analyzer.js';
-import { CROSS_LOBE_WEAK_SCORE_PENALTY, CROSS_LOBE_MIN_MATCH_RATIO } from './thresholds.js';
+import { formatStaleSection, formatConflictWarning, formatStats, formatBehaviorConfigSection, mergeTagFrequencies, buildQueryFooter, buildTagPrimerSection } from './formatters.js';
+import { extractKeywords, parseFilter, type FilterGroup } from './text-analyzer.js';
+import { CROSS_LOBE_WEAK_SCORE_PENALTY, CROSS_LOBE_MIN_MATCH_RATIO, VOCABULARY_ECHO_LIMIT, MAX_FOOTER_TAGS } from './thresholds.js';
 
 // --- Server health state ---
 // Tracks the degradation ladder: Running -> Degraded -> SafeMode
@@ -239,7 +239,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     // and memory_stats. The handler still works if called directly.
     {
       name: 'memory_store',
-      description: 'Store knowledge. "user" and "preferences" are global (no lobe needed). Example: memory_store(topic: "gotchas", title: "Build cache", content: "Must clean build after Tuist changes")',
+      description: 'Store knowledge. "user" and "preferences" are global (no lobe needed). Use tags for exact-match categorization. Add a shared tag (e.g., "test-entry") for bulk operations. Example: memory_store(topic: "gotchas", title: "Build cache", content: "Must clean build after Tuist changes", tags: ["build", "ios"])',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -278,13 +278,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: 'user (from human) > agent-confirmed > agent-inferred',
             default: 'agent-inferred',
           },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Category labels for exact-match retrieval (lowercase slugs). Query with filter: "#tag". Example: ["auth", "critical-path", "mite-combat"]',
+            default: [],
+          },
         },
         required: ['topic', 'title', 'content'],
       },
     },
     {
       name: 'memory_query',
-      description: 'Search stored knowledge. Searches all lobes when lobe is omitted. Example: memory_query(scope: "*", filter: "reducer sealed", detail: "full"). Use scope "*" to search everything. Use detail "full" for complete content.',
+      description: 'Search stored knowledge. Searches all lobes when lobe is omitted. Filter supports: keywords (stemmed), #tag (exact tag match), =term (exact keyword, no stemming), -term (NOT). Example: memory_query(scope: "*", filter: "#auth reducer", detail: "full")',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -301,7 +307,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           filter: {
             type: 'string',
-            description: 'Search terms. "A B" = AND, "A|B" = OR, "-A" = NOT. Example: "reducer sealed -deprecated"',
+            description: 'Search terms. "A B" = AND, "A|B" = OR, "-A" = NOT, "#tag" = exact tag, "=term" = exact keyword (no stemming). Example: "#auth reducer -deprecated"',
           },
           branch: {
             type: 'string',
@@ -450,7 +456,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'memory_store': {
-        const { lobe: rawLobe, topic: rawTopic, title, content, sources, references, trust: rawTrust } = z.object({
+        const { lobe: rawLobe, topic: rawTopic, title, content, sources, references, trust: rawTrust, tags: rawTags } = z.object({
           lobe: z.string().optional(),
           topic: z.string(),
           title: z.string().min(1),
@@ -458,6 +464,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           sources: z.array(z.string()).default([]),
           references: z.array(z.string()).default([]),
           trust: z.enum(['user', 'agent-confirmed', 'agent-inferred']).default('agent-inferred'),
+          tags: z.array(z.string()).default([]),
         }).parse(args);
 
         // Validate topic at boundary
@@ -492,6 +499,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           // User/preferences default to 'user' trust unless explicitly set otherwise
           isGlobal && trust === 'agent-inferred' ? 'user' : trust,
           references,
+          rawTags,
         );
 
         if (!result.stored) {
@@ -541,6 +549,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
           lines.push('');
           lines.push('Review the stored entry against these preferences for potential conflicts.');
+        }
+
+        // Vocabulary echo: show existing tags to drive convergence
+        if (hintCount < 2) {
+          const tagFreq = ctx.store.getTagFrequency();
+          if (tagFreq.size > 0) {
+            hintCount++;
+            const topTags = [...tagFreq.entries()]
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, VOCABULARY_ECHO_LIMIT)
+              .map(([tag, count]) => `${tag}(${count})`).join(', ');
+            const truncated = tagFreq.size > VOCABULARY_ECHO_LIMIT ? ` (top ${VOCABULARY_ECHO_LIMIT} shown)` : '';
+            lines.push('');
+            lines.push(`Existing tags: ${topTags}${truncated}. Reuse for consistency. Query with filter: "#tag".`);
+          }
         }
 
         return { content: [{ type: 'text', text: lines.join('\n') }] };
@@ -613,14 +636,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           })
           .sort((a, b) => b.relevanceScore - a.relevanceScore);
 
+        // Build stores collection for tag frequency aggregation
+        const searchedStores: MarkdownMemoryStore[] = [];
+        if (isGlobalQuery) {
+          searchedStores.push(globalStore);
+        } else if (rawLobe) {
+          const store = configManager.getStore(rawLobe);
+          if (store) searchedStores.push(store);
+        } else {
+          // All lobes + global when doing wildcard search
+          for (const lobeName of configManager.getLobeNames()) {
+            const store = configManager.getStore(lobeName);
+            if (store) searchedStores.push(store);
+          }
+          if (scope === '*') searchedStores.push(globalStore);
+        }
+        const tagFreq = mergeTagFrequencies(searchedStores);
+
+        // Parse filter once for both filtering (already done) and footer display
+        const filterGroups = filter ? parseFilter(filter) : [];
+
         if (allEntries.length === 0) {
-          const scopeHint = scope !== '*'
-            ? ` Try scope: "*" to search all topics, or use filter: "${filter ?? scope}" to search by keyword.`
-            : '';
+          const footer = buildQueryFooter({ filterGroups, rawFilter: filter, tagFreq, resultCount: 0, scope });
           return {
             content: [{
               type: 'text',
-              text: `[${label}] No entries found for scope "${scope}"${filter ? ` with filter "${filter}"` : ''}.${scopeHint}`,
+              text: `[${label}] No entries found for scope "${scope}"${filter ? ` with filter "${filter}"` : ''}.\n\n---\n${footer}`,
             }],
           };
         }
@@ -640,14 +681,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               `Fresh: ${e.fresh}`,
               e.sources?.length ? `Sources: ${e.sources.join(', ')}` : null,
               e.references?.length ? `References: ${e.references.join(', ')}` : null,
+              e.tags?.length ? `Tags: ${e.tags.join(', ')}` : null,
               `Created: ${e.created}`,
               `Last accessed: ${e.lastAccessed}`,
               e.gitSha ? `Git SHA: ${e.gitSha}` : null,
             ].filter(Boolean).join('\n');
             return `### ${e.title}\n${meta}\n\n${e.content}`;
           }
-          if (detail === 'standard' && e.references?.length) {
-            return `### ${e.title}\n*${e.id}${lobeTag} | confidence: ${e.confidence}${freshIndicator}*\nReferences: ${e.references.join(', ')}\n\n${e.summary}`;
+          if (detail === 'standard') {
+            const metaParts: string[] = [];
+            if (e.references?.length) metaParts.push(`References: ${e.references.join(', ')}`);
+            if (e.tags?.length) metaParts.push(`Tags: ${e.tags.join(', ')}`);
+            const metaLine = metaParts.length > 0 ? `\n${metaParts.join('\n')}\n` : '\n';
+            return `### ${e.title}\n*${e.id}${lobeTag} | confidence: ${e.confidence}${freshIndicator}*${metaLine}\n${e.summary}`;
           }
           return `### ${e.title}\n*${e.id}${lobeTag} | confidence: ${e.confidence}${freshIndicator}*\n\n${e.summary}`;
         });
@@ -664,27 +710,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        // Hints: teach the agent about capabilities it may not know about
-        const hints: string[] = [];
-
-        // Nudge: when searching all lobes, remind the agent to specify one for targeted results
-        const allQueryLobeNames = configManager.getLobeNames();
-        if (!rawLobe && !isGlobalQuery && allQueryLobeNames.length > 1) {
-          hints.push(`Searched all lobes (${allQueryLobeNames.join(', ')}). Specify lobe: "<name>" for targeted results.`);
-        }
-
-        if (detail !== 'full') {
-          hints.push('Use detail: "full" to see complete entry content.');
-        }
-        if (filter && !filter.includes(' ') && !filter.includes('|') && !filter.includes('-')) {
-          hints.push('Tip: combine terms with spaces (AND), | (OR), -term (NOT). Example: "reducer sealed -deprecated"');
-        }
-        if (!filter) {
-          hints.push('Tip: add filter: "keyword" to search within results.');
-        }
-        if (hints.length > 0) {
-          text += `\n\n---\n*${hints.join(' ')}*`;
-        }
+        // Build footer with query mode, tag vocabulary, and syntax reference
+        const footer = buildQueryFooter({ filterGroups, rawFilter: filter, tagFreq, resultCount: allEntries.length, scope });
+        text += `\n\n---\n${footer}`;
 
         return { content: [{ type: 'text', text }] };
       }
@@ -815,6 +843,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             sections.push('No knowledge stored yet. As you work, store observations with memory_store. Try memory_bootstrap to seed initial knowledge from the repo.');
           }
 
+          // Tag primer: show tag vocabulary if tags exist across any lobe
+          const briefingStores: MarkdownMemoryStore[] = [globalStore];
+          for (const lobeName of allBriefingLobeNames) {
+            const store = configManager.getStore(lobeName);
+            if (store) briefingStores.push(store);
+          }
+          const briefingTagFreq = mergeTagFrequencies(briefingStores);
+          const tagPrimer = buildTagPrimerSection(briefingTagFreq);
+          if (tagPrimer) {
+            sections.push(tagPrimer);
+          }
+
           const briefingHints: string[] = [];
           briefingHints.push(`${totalEntries} entries${totalStale > 0 ? ` (${totalStale} stale)` : ''} across ${allBriefingLobeNames.length} ${allBriefingLobeNames.length === 1 ? 'lobe' : 'lobes'}.`);
           briefingHints.push('Use memory_context(context: "what you are about to do") for task-specific knowledge.');
@@ -893,11 +933,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           })
           .slice(0, max);
 
+        // Build stores collection for tag frequency aggregation
+        const ctxSearchedStores: MarkdownMemoryStore[] = [globalStore];
+        if (rawLobe) {
+          const store = configManager.getStore(rawLobe);
+          if (store) ctxSearchedStores.push(store);
+        } else {
+          for (const lobeName of configManager.getLobeNames()) {
+            const store = configManager.getStore(lobeName);
+            if (store) ctxSearchedStores.push(store);
+          }
+        }
+        const ctxTagFreq = mergeTagFrequencies(ctxSearchedStores);
+
+        // Parse filter for footer (context search has no filter, pass empty)
+        const ctxFilterGroups: FilterGroup[] = [];
+
         if (results.length === 0) {
+          const ctxFooter = buildQueryFooter({ filterGroups: ctxFilterGroups, rawFilter: undefined, tagFreq: ctxTagFreq, resultCount: 0, scope: 'context search' });
           return {
             content: [{
               type: 'text',
-              text: `[${label}] No relevant knowledge found for: "${context}"\n\nThis is fine — proceed without prior context. As you learn things worth remembering, store them with memory_store.\nTry memory_query(scope: "*") to browse all entries.`,
+              text: `[${label}] No relevant knowledge found for: "${context}"\n\nThis is fine — proceed without prior context. As you learn things worth remembering, store them with memory_store.\n\n---\n${ctxFooter}`,
             }],
           };
         }
@@ -932,7 +989,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const marker = topic === 'gotchas' ? '[!] ' : topic === 'preferences' ? '[pref] ' : '';
             const keywords = r.matchedKeywords.length > 0 ? ` (matched: ${r.matchedKeywords.join(', ')})` : '';
             const lobeLabel = isCtxMultiLobe ? ` [${ctxEntryLobeMap.get(r.entry.id) ?? '?'}]` : '';
-            sections.push(`- **${marker}${r.entry.title}**${lobeLabel}: ${r.entry.content}${keywords}`);
+            const tagsSuffix = r.entry.tags?.length ? ` [tags: ${r.entry.tags.join(', ')}]` : '';
+            sections.push(`- **${marker}${r.entry.title}**${lobeLabel}: ${r.entry.content}${keywords}${tagsSuffix}`);
           }
           sections.push('');
         }
@@ -952,42 +1010,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           for (const kw of r.matchedKeywords) allMatchedKeywords.add(kw);
           matchedTopics.add(r.entry.topic);
         }
-
-        // Hints
-        const ctxHints: string[] = [];
-
-        // Nudge: when searching all lobes, infer the most relevant lobe from context keywords
-        // matching lobe names (e.g. "minion-miner" in context → suggest lobe "minion-miner"),
-        // falling back to the first lobe when no name overlap is found.
-        const allCtxLobeNames = configManager.getLobeNames();
-        if (!rawLobe && allCtxLobeNames.length > 1) {
-          const contextKws = extractKeywords(context);
-          const inferredLobe = allCtxLobeNames.find(name =>
-            [...extractKeywords(name)].some(kw => contextKws.has(kw))
-          ) ?? allCtxLobeNames[0];
-          ctxHints.push(`Searched all lobes. For faster, targeted results use lobe: "${inferredLobe}" (available: ${allCtxLobeNames.join(', ')}).`);
-        }
-
-        if (results.length >= max) {
-          ctxHints.push(`Showing top ${max} results. Increase maxResults or raise minMatch to refine.`);
-        }
-        if (threshold <= 0.2 && results.length > 5) {
-          ctxHints.push('Too many results? Use minMatch: 0.4 for stricter matching.');
-        }
-
-        // Session dedup hint — tell the agent not to re-call for these keywords
+        
         if (allMatchedKeywords.size > 0) {
           const kwList = Array.from(allMatchedKeywords).sort().join(', ');
           const topicList = Array.from(matchedTopics).sort().join(', ');
-          ctxHints.push(
-            `Context loaded for: ${kwList} (${topicList}). ` +
-            `This knowledge is now in your conversation — no need to call memory_context again for these terms this session.`
+          sections.push(
+            `---\n*Context loaded for: ${kwList} (${topicList}). ` +
+            `This knowledge is now in your conversation — no need to call memory_context again for these terms this session.*`
           );
         }
 
-        if (ctxHints.length > 0) {
-          sections.push(`---\n*${ctxHints.join(' ')}*`);
-        }
+        // Build footer (context search has no filter — it's natural language keyword matching)
+        const ctxFooter = buildQueryFooter({ filterGroups: ctxFilterGroups, rawFilter: undefined, tagFreq: ctxTagFreq, resultCount: results.length, scope: 'context search' });
+        sections.push(`---\n${ctxFooter}`);
 
         return { content: [{ type: 'text', text: sections.join('\n') }] };
       }

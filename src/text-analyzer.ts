@@ -22,10 +22,57 @@ const STOPWORDS = new Set([
   'up', 'out', 'then', 'also', 'use', 'used', 'using',
 ]);
 
-/** Parsed filter group: a set of required terms and excluded terms */
+/** Parsed filter group: required, excluded, exact-match, and tag terms */
 export interface FilterGroup {
   readonly must: Set<string>;
   readonly mustNot: Set<string>;
+  readonly mustExact: Set<string>;  // =term: exact match, no stemming
+  readonly mustTags: Set<string>;   // #tag: exact match against entry tags
+}
+
+/** Query mode summary — describes what a parsed filter actually searches */
+export type QueryMode =
+  | { readonly kind: 'no-filter' }
+  | { readonly kind: 'keyword-only'; readonly terms: readonly string[] }
+  | { readonly kind: 'tag-only'; readonly tags: readonly string[] }
+  | { readonly kind: 'complex'; readonly hasTags: boolean; readonly hasExact: boolean; readonly hasNot: boolean; readonly hasOr: boolean };
+
+/** Analyze parsed filter groups into QueryMode for display — pure function.
+ *  Accepts already-parsed FilterGroup[] to avoid reparsing. */
+export function analyzeFilterGroups(groups: readonly FilterGroup[]): QueryMode {
+  if (groups.length === 0) return { kind: 'no-filter' };
+  
+  // Aggregate all filter features across OR groups
+  const allMust = new Set<string>();
+  const allMustNot = new Set<string>();
+  const allMustExact = new Set<string>();
+  const allMustTags = new Set<string>();
+  
+  for (const g of groups) {
+    for (const t of g.must) allMust.add(t);
+    for (const t of g.mustNot) allMustNot.add(t);
+    for (const t of g.mustExact) allMustExact.add(t);
+    for (const t of g.mustTags) allMustTags.add(t);
+  }
+  
+  const hasTags = allMustTags.size > 0;
+  const hasExact = allMustExact.size > 0;
+  const hasNot = allMustNot.size > 0;
+  const hasOr = groups.length > 1;
+  const hasKeywords = allMust.size > 0;
+  
+  // Pure tag-only (no other features)
+  if (hasTags && !hasExact && !hasNot && !hasOr && !hasKeywords) {
+    return { kind: 'tag-only', tags: [...allMustTags] };
+  }
+  
+  // Pure keyword-only (no other features)
+  if (hasKeywords && !hasTags && !hasExact && !hasNot && !hasOr) {
+    return { kind: 'keyword-only', terms: [...allMust] };
+  }
+  
+  // Everything else is complex (mixed features)
+  return { kind: 'complex', hasTags, hasExact, hasNot, hasOr };
 }
 
 /** Naive stem: strip common English suffixes to improve keyword matching.
@@ -125,6 +172,8 @@ export function parseFilter(filter: string): FilterGroup[] {
     const terms = group.split(/\s+/).filter(t => t.length > 0);
     const must = new Set<string>();
     const mustNot = new Set<string>();
+    const mustExact = new Set<string>();
+    const mustTags = new Set<string>();
 
     for (const term of terms) {
       if (term.startsWith('-') && term.length > 1) {
@@ -133,6 +182,12 @@ export function parseFilter(filter: string): FilterGroup[] {
         // not standalone "memory" or "mcp".
         const raw = term.slice(1).toLowerCase().replace(/[^a-z0-9_-]/g, '');
         if (raw.length > 2) mustNot.add(stem(raw));
+      } else if (term.startsWith('#') && term.length > 1) {
+        // Tag filter: exact match against entry tags, no stemming
+        mustTags.add(term.slice(1).toLowerCase());
+      } else if (term.startsWith('=') && term.length > 1) {
+        // Exact keyword match: bypasses stemming
+        mustExact.add(term.slice(1).toLowerCase());
       } else {
         // Positive terms: full expansion (hyphens split into parts)
         for (const kw of extractKeywords(term)) {
@@ -140,42 +195,55 @@ export function parseFilter(filter: string): FilterGroup[] {
         }
       }
     }
-    return { must, mustNot };
+    return { must, mustNot, mustExact, mustTags };
   });
 }
 
 /** Check if a set of keywords matches a filter string using stemmed AND/OR/NOT logic.
- *  Entry matches if ANY OR-group is satisfied (all must-terms present, no mustNot-terms present). */
-export function matchesFilter(allKeywords: Set<string>, filter: string): boolean {
+ *  Entry matches if ANY OR-group is satisfied (all must-terms present, no mustNot-terms present).
+ *  Supports =exact (no stemming) and #tag (exact match against entry tags). */
+export function matchesFilter(allKeywords: Set<string>, filter: string, tags?: readonly string[]): boolean {
   const groups = parseFilter(filter);
   if (groups.length === 0) return true;
 
-  return groups.some(({ must, mustNot }) => {
+  const entryTags = new Set(tags ?? []);
+
+  return groups.some(({ must, mustNot, mustExact, mustTags }) => {
     for (const term of must) {
       if (!allKeywords.has(term)) return false;
     }
     for (const term of mustNot) {
       if (allKeywords.has(term)) return false;
     }
-    return must.size > 0 || mustNot.size > 0;
+    for (const term of mustExact) {
+      if (!allKeywords.has(term)) return false;
+    }
+    for (const tag of mustTags) {
+      if (!entryTags.has(tag)) return false;
+    }
+    return must.size > 0 || mustNot.size > 0 || mustExact.size > 0 || mustTags.size > 0;
   });
 }
 
 /** Compute relevance score for an entry against a filter.
- *  Title matches get 2x weight over content-only matches. */
+ *  Title matches get 2x weight over content-only matches.
+ *  Tag and exact matches count as full-weight hits (same as title). */
 export function computeRelevanceScore(
   titleKeywords: Set<string>,
   contentKeywords: Set<string>,
   confidence: number,
   filter: string,
+  tags?: readonly string[],
 ): number {
   const groups = parseFilter(filter);
   if (groups.length === 0) return 0;
 
+  const entryTags = new Set(tags ?? []);
   let bestScore = 0;
 
-  for (const { must } of groups) {
-    if (must.size === 0) continue;
+  for (const { must, mustExact, mustTags } of groups) {
+    const totalTerms = must.size + mustExact.size + mustTags.size;
+    if (totalTerms === 0) continue;
     let score = 0;
     for (const term of must) {
       if (titleKeywords.has(term)) {
@@ -184,7 +252,18 @@ export function computeRelevanceScore(
         score += 1.0;  // content-only match
       }
     }
-    const normalized = score / must.size;
+    for (const term of mustExact) {
+      if (titleKeywords.has(term)) {
+        score += 2.0;
+      } else if (contentKeywords.has(term)) {
+        score += 1.0;
+      }
+    }
+    // Tag matches count as high-value (same as title hits)
+    for (const tag of mustTags) {
+      if (entryTags.has(tag)) score += 2.0;
+    }
+    const normalized = score / totalTerms;
     if (normalized > bestScore) bestScore = normalized;
   }
 
