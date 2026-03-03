@@ -278,8 +278,7 @@ describe('E2E: MCP Server', () => {
     it('stores a knowledge entry', async () => {
       const response = await client.callTool('memory_store', {
         topic: 'architecture',
-        title: 'E2E Test Pattern',
-        content: 'This repo uses MVI architecture with standalone reducers',
+        entries: [{ title: 'E2E Test Pattern', fact: 'This repo uses MVI architecture with standalone reducers' }],
         trust: 'user',
       });
       assert.ok(!client.isError(response), `Store should succeed: ${client.getText(response)}`);
@@ -387,20 +386,17 @@ describe('E2E: MCP Server', () => {
       // Seed entries for context search
       await client.callTool('memory_store', {
         topic: 'architecture',
-        title: 'Kotlin Reducer Pattern',
-        content: 'Standalone reducer classes with inject constructor in Kotlin',
+        entries: [{ title: 'Kotlin Reducer Pattern', fact: 'Standalone reducer classes with inject constructor in Kotlin' }],
         trust: 'user',
       });
       await client.callTool('memory_store', {
         topic: 'conventions',
-        title: 'Kotlin Naming',
-        content: 'Use Real prefix instead of Impl postfix for Kotlin implementation classes',
+        entries: [{ title: 'Kotlin Naming', fact: 'Use Real prefix instead of Impl postfix for Kotlin implementation classes' }],
         trust: 'user',
       });
       await client.callTool('memory_store', {
         topic: 'gotchas',
-        title: 'Kotlin Build Gotcha',
-        content: 'Must clean build after Kotlin module dependency changes',
+        entries: [{ title: 'Kotlin Build Gotcha', fact: 'Must clean build after Kotlin module dependency changes' }],
         trust: 'user',
       });
     });
@@ -481,8 +477,7 @@ describe('E2E: MCP Server', () => {
     it('rejects invalid topic', async () => {
       const response = await client.callTool('memory_store', {
         topic: 'banana',
-        title: 'Test',
-        content: 'Test',
+        entries: [{ title: 'Test', fact: 'Test content' }],
       });
       assert.ok(client.isError(response), 'Should be an error');
       const text = client.getText(response);
@@ -517,8 +512,7 @@ describe('E2E: MCP Server', () => {
     it('handles correction without text for append', async () => {
       const storeResp = await client.callTool('memory_store', {
         topic: 'conventions',
-        title: 'Temp Entry for Error Test',
-        content: 'temp',
+        entries: [{ title: 'Temp Entry for Error Test', fact: 'Temporary entry for error handling test' }],
       });
       const idMatch = client.getText(storeResp).match(/(conv-[0-9a-f]+)/);
       if (idMatch) {
@@ -535,24 +529,24 @@ describe('E2E: MCP Server', () => {
   });
 
   describe('param alias normalization (e2e)', () => {
-    it('resolves key/value aliases to title/content', async () => {
+    it('resolves refs alias to references', async () => {
       const response = await client.callTool('memory_store', {
         topic: 'conventions',
-        key: 'Alias Test',
-        value: 'Testing param alias normalization works e2e',
+        entries: [{ title: 'Refs Alias Normalization', fact: 'Testing refs param alias normalization works e2e' }],
+        refs: ['src/normalize.ts'],
         trust: 'agent-inferred',
       });
       assert.ok(!client.isError(response), `Alias store should succeed: ${client.getText(response)}`);
       const text = client.getText(response);
       assert.ok(text.includes('Stored entry'), 'Should confirm storage');
 
-      // Verify the entry was actually stored with the alias-resolved title
+      // Verify the entry was actually stored with the refs-resolved references
       const queryResp = await client.callTool('memory_query', {
         scope: 'conventions',
         detail: 'full',
-        filter: 'Alias Test',
+        filter: 'Refs Alias Normalization',
       });
-      assert.ok(client.getText(queryResp).includes('Alias Test'), 'Should store with aliased title');
+      assert.ok(client.getText(queryResp).includes('normalize.ts'), 'refs alias should be normalized to references');
 
       // Cleanup
       const idMatch = text.match(/(conv-[0-9a-f]+)/);
@@ -567,16 +561,14 @@ describe('E2E: MCP Server', () => {
       // Store first entry
       await client.callTool('memory_store', {
         topic: 'conventions',
-        title: 'Sealed Interface Convention',
-        content: 'Always use sealed interfaces for state management events in Kotlin',
+        entries: [{ title: 'Sealed Interface Convention', fact: 'Always use sealed interfaces for state management events in Kotlin' }],
         trust: 'user',
       });
 
       // Store very similar entry
       const response = await client.callTool('memory_store', {
         topic: 'conventions',
-        title: 'State Management Conventions',
-        content: 'Use sealed interfaces for state management events and actions in Kotlin modules',
+        entries: [{ title: 'State Management Conventions', fact: 'Use sealed interfaces for state management events and actions in Kotlin modules' }],
         trust: 'user',
       });
       assert.ok(!client.isError(response));
@@ -592,18 +584,15 @@ describe('E2E: MCP Server', () => {
       // Store in multiple topics
       const arch = await client.callTool('memory_store', {
         topic: 'architecture',
-        title: 'Multi-Topic Arch',
-        content: 'Multi-topic architecture test',
+        entries: [{ title: 'Multi-Topic Arch', fact: 'Multi-topic architecture test' }],
       });
       const conv = await client.callTool('memory_store', {
         topic: 'conventions',
-        title: 'Multi-Topic Conv',
-        content: 'Multi-topic conventions test',
+        entries: [{ title: 'Multi-Topic Conv', fact: 'Multi-topic conventions test' }],
       });
       const gotcha = await client.callTool('memory_store', {
         topic: 'gotchas',
-        title: 'Multi-Topic Gotcha',
-        content: 'Multi-topic gotcha test',
+        entries: [{ title: 'Multi-Topic Gotcha', fact: 'Multi-topic gotcha test' }],
       });
 
       assert.ok(!client.isError(arch));
@@ -637,8 +626,7 @@ describe('E2E: MCP Server', () => {
     it('stores and queries module-scoped entries', async () => {
       const response = await client.callTool('memory_store', {
         topic: 'modules/messaging',
-        title: 'Messaging Module Overview',
-        content: 'The messaging module handles real-time chat with StreamCoordinator',
+        entries: [{ title: 'Messaging Module Overview', fact: 'The messaging module handles real-time chat with StreamCoordinator' }],
       });
       assert.ok(!client.isError(response), `Module store should succeed: ${client.getText(response)}`);
       const text = client.getText(response);
@@ -663,8 +651,7 @@ describe('E2E: MCP Server', () => {
     it('stores and queries references via tool call', async () => {
       const storeResp = await client.callTool('memory_store', {
         topic: 'architecture',
-        title: 'Messaging Reducer Architecture',
-        content: 'The messaging feature uses a standalone reducer pattern with sealed interface events',
+        entries: [{ title: 'Messaging Reducer Architecture', fact: 'The messaging feature uses a standalone reducer pattern with sealed interface events' }],
         references: ['features/messaging/impl/MessagingReducer.kt', 'features/messaging/api/MessagingEvent.kt'],
         trust: 'agent-confirmed',
       });
@@ -693,8 +680,7 @@ describe('E2E: MCP Server', () => {
     it('accepts refs alias for references', async () => {
       const storeResp = await client.callTool('memory_store', {
         topic: 'conventions',
-        title: 'Refs Alias Test',
-        content: 'Testing that refs is accepted as an alias for references field in tool calls',
+        entries: [{ title: 'Refs Alias Test', fact: 'Testing that refs is accepted as an alias for references field in tool calls' }],
         refs: ['src/SomeClass.kt'],
       });
       assert.ok(!client.isError(storeResp), `Store with refs alias should succeed: ${client.getText(storeResp)}`);
@@ -726,8 +712,7 @@ describe('E2E: MCP Server', () => {
       // Store an entry
       const storeResp = await client.callTool('memory_store', {
         topic: 'architecture',
-        title: 'Touchable Entry',
-        content: 'Architecture pattern to verify timestamp refresh via empty append',
+        entries: [{ title: 'Touchable Entry', fact: 'Architecture pattern to verify timestamp refresh via empty append' }],
         trust: 'agent-inferred',
       });
       assert.ok(!client.isError(storeResp));
@@ -769,14 +754,12 @@ describe('E2E: MCP Server', () => {
 
       const r1 = await client.callTool('memory_store', {
         topic: 'architecture',
-        title: 'MVI Architecture Overview',
-        content: longShared,
+        entries: [{ title: 'MVI Architecture Overview', fact: longShared }],
         trust: 'user',
       });
       const r2 = await client.callTool('memory_store', {
         topic: 'conventions',
-        title: 'Architecture Conventions',
-        content: longShared + ' following clean architecture principles',
+        entries: [{ title: 'Architecture Conventions', fact: longShared + ' following clean architecture principles' }],
         trust: 'user',
       });
       assert.ok(!client.isError(r1) && !client.isError(r2), 'Both stores should succeed');
@@ -848,8 +831,7 @@ describe('E2E: MCP Server', () => {
     it('surfaces ephemeral warning for temporal content via tool call', async () => {
       const resp = await client.callTool('memory_store', {
         topic: 'gotchas',
-        title: 'Ephemeral Test Entry',
-        content: 'The build is currently broken and we are investigating the root cause right now',
+        entries: [{ title: 'Ephemeral Test Entry', fact: 'The build is currently broken and we are investigating the root cause right now' }],
         trust: 'agent-inferred',
       });
       assert.ok(!client.isError(resp), `Store should succeed: ${client.getText(resp)}`);
@@ -866,8 +848,7 @@ describe('E2E: MCP Server', () => {
     it('surfaces ephemeral warning for fixed-bug content', async () => {
       const resp = await client.callTool('memory_store', {
         topic: 'gotchas',
-        title: 'Fixed Bug Entry',
-        content: 'The crash bug in messaging has been resolved by updating the dependency injection scope',
+        entries: [{ title: 'Fixed Bug Entry', fact: 'The crash bug in messaging has been resolved by updating the dependency injection scope' }],
         trust: 'agent-confirmed',
       });
       assert.ok(!client.isError(resp));
@@ -882,8 +863,7 @@ describe('E2E: MCP Server', () => {
     it('does not surface ephemeral warning for durable content', async () => {
       const resp = await client.callTool('memory_store', {
         topic: 'architecture',
-        title: 'Durable Architecture Entry',
-        content: 'The messaging feature uses MVI with standalone reducer classes and sealed interface events for exhaustive handling',
+        entries: [{ title: 'Durable Architecture Entry', fact: 'The messaging feature uses MVI with standalone reducer classes and sealed interface events for exhaustive handling' }],
         trust: 'user',
       });
       assert.ok(!client.isError(resp));
