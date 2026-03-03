@@ -309,6 +309,30 @@ const EPHEMERAL_CASES: readonly BenchmarkCase[] = [
   { title: 'Trait Object Vtable Explosion', content: 'Trait objects derived from our generic Effect trait were generating 18KB vtables due to monomorphization. Splitting into two traits reduced this significantly.', topic: 'architecture', label: 'ephemeral' },
   { title: 'Cargo Feature Interaction Bug', content: 'Enabling both experimental-simd and avx2-optimization features creates a link error in dependencies. Documented as a known issue; users must pick one.', topic: 'preferences', label: 'ephemeral' },
   { title: 'Lifetime Inference in Closures', content: 'Generic closures capturing references in our callback API required explicit lifetime annotations that shouldn\'t be necessary. Workaround: boxing closures into dyn Fn. Revisiting once HRTB becomes more stable.', topic: 'gotchas', label: 'ephemeral' },
+
+  // ── NEW: Completed-task announcements ────────────────────────────────
+  // The original failing case — stored as permanent knowledge but is a session work summary.
+  { title: 'Documentation updates complete - Prosthetics split implementation', content: 'Completed systematic documentation update for Prosthetics split. 14 docs modified (508 additions, 173 deletions). Created decision record at docs/decisions/prosthetics-split-2026-03.md. Major changes: summoning.md (Foundations + 13 categories). All cross-references validated. Tag taxonomy updated. Remaining: 16 open questions documented in OPEN.md.', topic: 'modules/eidola' as any, label: 'ephemeral', expectedSignals: ['completed-task', 'diff-stats', 'task-language'] },
+  { title: 'Database migration complete', content: 'All tables have been migrated to the new schema. Verified on staging before promoting to production.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['completed-task'] },
+  { title: 'Refactor done', content: 'The messaging reducer has been extracted into a standalone class and all tests pass.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['completed-task'] },
+  { title: 'Sprint wrap-up', content: 'Completed the port of the messaging feature from the legacy codebase. All acceptance criteria met.', topic: 'modules/messaging' as any, label: 'ephemeral', expectedSignals: ['completed-task'] },
+  { title: 'Auth flow updated', content: 'Successfully deployed the new authentication flow to all production regions. Rollback plan archived.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['completed-task'] },
+  { title: 'Cross-reference pass', content: 'All cross-references validated. Tag taxonomy updated. No broken links found.', topic: 'modules/docs' as any, label: 'ephemeral', expectedSignals: ['completed-task'] },
+  { title: 'Room migration', content: 'The Room schema migration has been completed and verified against the prod snapshot. Zero data loss confirmed.', topic: 'gotchas', label: 'ephemeral', expectedSignals: ['completed-task'] },
+
+  // ── NEW: Diff stats / work metrics ───────────────────────────────────
+  { title: 'PR Merged', content: 'Messaging refactor landed. 23 files changed, 508 additions, 173 deletions.', topic: 'modules/messaging' as any, label: 'ephemeral', expectedSignals: ['diff-stats'] },
+  { title: 'Doc Sprint', content: '14 docs modified to reflect the new Prosthetics module split.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['diff-stats'] },
+  { title: 'Dead Code Pass', content: '42 files changed during the dead code removal. Bundle size reduced by 18kb.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['diff-stats'] },
+
+  // ── NEW: Remaining/open-items in work summaries ───────────────────────
+  { title: 'Migration Status', content: 'Core migration is done. Remaining: update all downstream consumers, add integration tests.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['task-language'] },
+  { title: 'Feature Wrap-up', content: 'Most features shipped. Open items: analytics integration, dark mode toggle, accessibility audit.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['task-language'] },
+
+  // ── NEW: Shipped / deployed / merged ─────────────────────────────────
+  { title: 'Production Deploy', content: 'The authentication fix was deployed to production at 14:00 UTC after smoke tests passed on staging.', topic: 'gotchas', label: 'ephemeral', expectedSignals: ['shipped', 'completed-task'] },
+  { title: 'Feature Merge', content: 'The messaging feature branch was merged into main after the security review was signed off.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['shipped'] },
+  { title: 'SDK Publish', content: 'The memory-mcp SDK was released as v0.2.0 with the tag system and crash journal included.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['shipped'] },
 ];
 
 // ─── DURABLE CASES (should produce NO signals) ───────────────────────────

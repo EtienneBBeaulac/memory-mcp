@@ -285,9 +285,65 @@ const SIGNALS: readonly SignalDefinition[] = [
         /\b(doesn'?t|don'?t) (handle|support|implement).*\byet\b/,
         /\bis (underway|not finished|not complete)\b/,
         /\bblocked on\b/,
+        // Work-remaining section markers (colon required to avoid matching prose)
+        /\bremaining\s*:/, /\bopen items?\s*:/, /\bstill to do\s*:/,
+        /\bpending (tasks?|items?|work)\s*:/,
       ];
       const m = firstMatch(content, patterns);
       return m ? `contains "${m[0]}" — task tracking doesn't belong in long-term memory` : undefined;
+    },
+  },
+
+  // ── Completed task / work summary ──────────────────────────────────────
+  // Catches session work summaries stored as permanent knowledge.
+  // "Documentation updates complete", "Completed the migration", "All X validated".
+  {
+    id: 'completed-task',
+    label: 'Completed task announcement',
+    confidence: 'high',
+    test: (title, content) => {
+      const titlePatterns = [
+        // "Documentation updates complete", "migration done", "task finished"
+        /\b(update|migration|refactor|implementation|task|feature|docs?|documentation|sync|work|changes?|setup)\s+(complete[d]?|done|finished?)\b/,
+        // "Complete: X" or "Done - X" as a status prefix in the title
+        /^(complete[d]?|done|finished?)\s*[-–—:]/,
+      ];
+      const contentPatterns = [
+        // Content that opens with a completion verb — strongest signal
+        /^completed?\s+\w/,
+        // "Successfully completed/deployed/merged/migrated..."
+        /\bsuccessfully\s+(completed?|deployed?|merged?|migrated?|updated?|implemented?|refactored?)\b/,
+        // "All cross-references validated", "All tests done"
+        // [\w-] (no \s) restricts to single-word or hyphenated nouns, preventing
+        // "Every code fix is validated" (a durable policy) from matching
+        /\b(all|every)\s+\S[\w-]{0,25}\s+(validated?|complete[d]?|verified?|done)\b/,
+        // "has been completed/finished/merged/deployed"
+        /\b(has|have)\s+been\s+(completed?|finished?|merged?|deployed?)\b/,
+      ];
+      const tm = firstMatch(title, titlePatterns);
+      if (tm) return `title contains "${tm[0]}" — task completion announcements aren't durable knowledge`;
+      const cm = firstMatch(content, contentPatterns);
+      return cm ? `contains "${cm[0]}" — task completion announcements aren't durable knowledge` : undefined;
+    },
+  },
+
+  // ── Diff stats / work metrics ──────────────────────────────────────────
+  // Quantitative work summaries ("14 docs modified", "508 additions, 173 deletions")
+  // never appear in durable knowledge — they're always session activity reports.
+  {
+    id: 'diff-stats',
+    label: 'Diff stats or work metrics',
+    confidence: 'high',
+    test: (_title, _content, raw) => {
+      const content = raw.content.toLowerCase();
+      const patterns = [
+        // Git-style: "(508 additions, 173 deletions)" or "508 additions, 173 deletions"
+        /\b\d+\s+additions?,\s*\d+\s+deletions?\b/,
+        // Work quantity: "14 docs modified", "5 files changed"
+        /\b\d+\s+(docs?|files?|tests?|endpoints?|functions?|modules?|classes?|pages?)\s+(modified|changed|updated|added|created|deleted)\b/,
+      ];
+      const m = firstMatch(content, patterns);
+      return m ? `"${m[0]}" — quantitative work metrics are session activity, not lasting knowledge` : undefined;
     },
   },
 
@@ -451,6 +507,28 @@ const SIGNALS: readonly SignalDefinition[] = [
     },
   },
 
+  // ── Shipped / released / merged ────────────────────────────────────────
+  // Positive deployment/release language not already caught by temporal.
+  // ("just deployed" is caught by temporal; this catches statements without "just".)
+  {
+    id: 'shipped',
+    label: 'Deployed, released, or merged',
+    confidence: 'medium',
+    test: (_title, content) => {
+      const patterns = [
+        // "was/got/has been deployed to production/staging/main" — past-tense anchor prevents
+        // firing on policy conventions like "is deployed to production before release"
+        /\b(?:was|were|got|has been)\s+deployed?\s+(?:to|into)\s+(production|prod|staging|main|master)\b/,
+        // "was/got/has been merged into main/master/develop/trunk"
+        /\b(?:was|were|got|has been)\s+merged?\s+(?:to|into)\s+(main|master|develop|trunk)\b/,
+        // "released to production" or "released as v1.2" or "released as version 1.2"
+        /\breleased?\s+(?:to\s+(?:production|prod)|(?:as\s+)?(?:version\s+)?v?\d+\.\d+)\b/,
+      ];
+      const m = firstMatch(content, patterns);
+      return m ? `"${m[0]}" — deployment/release events are ephemeral; store the resulting behavior instead` : undefined;
+    },
+  },
+
   // ── Pending decision / under evaluation ─────────────────────────────────
   {
     id: 'pending-decision',
@@ -500,6 +578,31 @@ const SIGNALS: readonly SignalDefinition[] = [
       ];
       const m = firstMatch(content, patterns);
       return m ? `"${m[0]}" — metric changes are often transient observations` : undefined;
+    },
+  },
+
+  // ── Bundling conjunctions ──────────────────────────────────────────────
+  // Catches agents that put multiple unrelated facts in a single entry using
+  // explicit linking language. Only fires on sentence-boundary connectors
+  // (comma or start of new sentence) to avoid false positives on prose like
+  // "X and Y work together" or "also useful for Z".
+  {
+    id: 'bundling-conjunction',
+    label: 'Multiple facts bundled',
+    confidence: 'low',
+    test: (_title, content) => {
+      const patterns = [
+        /[,;]\s+also\b/i,             // "X works this way, also Y does Z"
+        /[.!?]\s+additionally,/i,      // ". Additionally, ..."
+        /[.!?]\s+furthermore,/i,       // ". Furthermore, ..."
+        /\bunrelated:/i,               // "Unrelated: ..."
+        /\bseparately:/i,              // "Separately: ..."
+        /[.!?]\s+on a (separate|different|unrelated) note[,:]?/i,
+      ];
+      const m = firstMatch(content, patterns);
+      return m
+        ? `"${m[0]}" — consider splitting into separate entries (one insight per entry)`
+        : undefined;
     },
   },
 
@@ -584,13 +687,15 @@ export function formatEphemeralWarning(signals: readonly EphemeralSignal[]): str
   ];
 
   // Scale the guidance with confidence — high-confidence gets direct advice,
-  // low-confidence gets a softer suggestion to let the agent decide
+  // low-confidence gets a softer suggestion to let the agent decide.
+  // Always include the positive redirect: store state, not events.
   if (highCount >= 2) {
     lines.push('This is almost certainly session-specific. Consider deleting after your session.');
+    lines.push('If there is a lasting insight here, rephrase it as a present-tense fact: what is now true about the codebase?');
   } else if (highCount === 1) {
-    lines.push('If this is a lasting insight, keep it. If session-specific, consider deleting after your session.');
+    lines.push('If this is a lasting insight, rephrase it as a present-tense fact (what is now true) rather than an action report (what you did). If session-specific, consider deleting after your session.');
   } else {
-    lines.push('This might still be valid long-term knowledge — use your judgment.');
+    lines.push('If this is durable knowledge, rephrase as a present-tense fact: what is now true? If it describes what you did rather than what is, consider deleting after your session.');
   }
 
   return lines.join('\n');

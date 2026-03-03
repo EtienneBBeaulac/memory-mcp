@@ -624,27 +624,29 @@ describe('ephemeral detection', () => {
     });
 
     it('includes actionable guidance scaled to confidence', () => {
-      // Single high-confidence: moderate advice
+      // Single high-confidence: moderate advice + present-tense redirect
       const singleHigh = formatEphemeralWarning([
         { id: 'temporal', label: 'Temporal language', detail: 'contains "today"', confidence: 'high' },
       ]);
       assert.ok(singleHigh);
       assert.ok(singleHigh.includes('lasting insight'), 'Single high should suggest keeping if lasting');
+      assert.ok(singleHigh.includes('present-tense'), 'Single high should redirect to present-tense facts');
 
-      // Two high-confidence: strong advice
+      // Two high-confidence: strong advice + present-tense redirect
       const twoHigh = formatEphemeralWarning([
         { id: 'temporal', label: 'Temporal', detail: 'contains "today"', confidence: 'high' },
         { id: 'stack-trace', label: 'Stack trace', detail: 'stack trace detected', confidence: 'high' },
       ]);
       assert.ok(twoHigh);
       assert.ok(twoHigh.includes('almost certainly session-specific'), 'Two high should strongly advise deletion');
+      assert.ok(twoHigh.includes('present-tense'), 'Two high should redirect to present-tense facts');
 
-      // Medium-only: soft advice
+      // Medium-only: soft advice + present-tense redirect
       const mediumOnly = formatEphemeralWarning([
         { id: 'uncertainty', label: 'Uncertain', detail: 'contains "maybe"', confidence: 'medium' },
       ]);
       assert.ok(mediumOnly);
-      assert.ok(mediumOnly.includes('use your judgment'), 'Medium-only should defer to agent judgment');
+      assert.ok(mediumOnly.includes('present-tense'), 'Medium-only should still redirect to present-tense facts');
     });
   });
 
@@ -694,6 +696,296 @@ describe('ephemeral detection', () => {
         'preferences',
       );
       assert.strictEqual(signals.length, 0, `Expected no signals, got: ${signals.map(s => s.id).join(', ')}`);
+    });
+  });
+
+  // ── task-language: remaining/open-items extension ─────────────────────
+
+  describe('task-language: remaining/open-items patterns', () => {
+    it('detects "Remaining:" section header', () => {
+      const signals = detectEphemeralSignals(
+        'Prosthetics Split Summary',
+        'Completed the split. Remaining: 16 open questions documented in OPEN.md.',
+        'modules/eidola' as any,
+      );
+      assert.ok(signals.some(s => s.id === 'task-language'));
+    });
+
+    it('detects "Open items:" section header', () => {
+      const signals = detectEphemeralSignals(
+        'Sprint Wrap-up',
+        'Most features are shipped. Open items: analytics integration, dark mode toggle.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'task-language'));
+    });
+
+    it('detects "Still to do:" section header', () => {
+      const signals = detectEphemeralSignals(
+        'Migration Status',
+        'Core migration is done. Still to do: update all downstream consumers.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'task-language'));
+    });
+
+    it('does not flag "remaining" used in plain prose without colon', () => {
+      const signals = detectEphemeralSignals(
+        'Pagination API',
+        'The endpoint returns the remaining items in the cursor-paginated list.',
+        'architecture',
+      );
+      assert.ok(!signals.some(s => s.id === 'task-language'));
+    });
+  });
+
+  // ── Completed task signal ─────────────────────────────────────────────
+
+  describe('completed-task signal', () => {
+    it('detects the original failing case: task completion summary', () => {
+      const signals = detectEphemeralSignals(
+        'Documentation updates complete - Prosthetics split implementation',
+        'Completed systematic documentation update for Prosthetics split. 14 docs modified (508 additions, 173 deletions).',
+        'modules/eidola' as any,
+      );
+      assert.ok(signals.length > 0, `Expected at least one signal, got none`);
+    });
+
+    it('detects task-noun + "complete" in title', () => {
+      const signals = detectEphemeralSignals(
+        'Database migration complete',
+        'All tables have been migrated to the new schema.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'completed-task'));
+    });
+
+    it('detects "done" suffix in title', () => {
+      const signals = detectEphemeralSignals(
+        'Refactor done',
+        'The messaging reducer has been extracted into a standalone class.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'completed-task'));
+    });
+
+    it('detects content starting with "Completed"', () => {
+      const signals = detectEphemeralSignals(
+        'Messaging Feature',
+        'Completed the port of the messaging feature from the legacy codebase to the new MVI architecture.',
+        'modules/messaging' as any,
+      );
+      assert.ok(signals.some(s => s.id === 'completed-task'));
+    });
+
+    it('detects "successfully deployed/merged"', () => {
+      const signals = detectEphemeralSignals(
+        'Release',
+        'Successfully deployed the new authentication flow to all production regions.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'completed-task'));
+    });
+
+    it('detects "all X validated"', () => {
+      const signals = detectEphemeralSignals(
+        'Validation Pass',
+        'All cross-references validated. Tag taxonomy updated.',
+        'modules/docs' as any,
+      );
+      assert.ok(signals.some(s => s.id === 'completed-task'));
+    });
+
+    it('detects "has been completed"', () => {
+      const signals = detectEphemeralSignals(
+        'Sprint Closure',
+        'The Room migration has been completed and all tests pass on both API levels.',
+        'gotchas',
+      );
+      assert.ok(signals.some(s => s.id === 'completed-task'));
+    });
+
+    it('does not flag prescriptive "must be completed" language', () => {
+      const signals = detectEphemeralSignals(
+        'Migration Convention',
+        'Each schema migration must be completed before the app starts or Room will throw.',
+        'conventions',
+      );
+      assert.ok(!signals.some(s => s.id === 'completed-task'));
+    });
+
+    it('does not flag conditional "once done" language', () => {
+      const signals = detectEphemeralSignals(
+        'Build Caching',
+        'The Gradle build cache is valid once the sync is done. Invalidation happens on buildSrc changes.',
+        'gotchas',
+      );
+      assert.ok(!signals.some(s => s.id === 'completed-task'));
+    });
+  });
+
+  // ── Diff stats signal ─────────────────────────────────────────────────
+
+  describe('diff-stats signal', () => {
+    it('detects git-style "N additions, M deletions"', () => {
+      const signals = detectEphemeralSignals(
+        'PR Summary',
+        'Refactoring complete. 508 additions, 173 deletions across the messaging module.',
+        'modules/messaging' as any,
+      );
+      assert.ok(signals.some(s => s.id === 'diff-stats'));
+    });
+
+    it('detects parenthesised diff stats', () => {
+      const signals = detectEphemeralSignals(
+        'Documentation update',
+        '14 docs modified (508 additions, 173 deletions).',
+        'modules/eidola' as any,
+      );
+      assert.ok(signals.some(s => s.id === 'diff-stats'));
+    });
+
+    it('detects "N files changed"', () => {
+      const signals = detectEphemeralSignals(
+        'Cleanup Session',
+        '23 files changed as part of the dead code removal pass.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'diff-stats'));
+    });
+
+    it('detects "N docs modified"', () => {
+      const signals = detectEphemeralSignals(
+        'Doc Sprint',
+        '14 docs modified to reflect the new module structure.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'diff-stats'));
+    });
+
+    it('does not flag plain "N files in the module" structural facts', () => {
+      const signals = detectEphemeralSignals(
+        'Module Structure',
+        'The messaging module contains 14 files split across three packages.',
+        'architecture',
+      );
+      assert.ok(!signals.some(s => s.id === 'diff-stats'));
+    });
+
+    it('does not flag "diff" used conceptually without numbers', () => {
+      const signals = detectEphemeralSignals(
+        'Review Practice',
+        'Always review the diff before merging to catch unintended changes.',
+        'conventions',
+      );
+      assert.ok(!signals.some(s => s.id === 'diff-stats'));
+    });
+  });
+
+  // ── Shipped signal ────────────────────────────────────────────────────
+
+  describe('shipped signal', () => {
+    it('detects "was deployed to production"', () => {
+      const signals = detectEphemeralSignals(
+        'Hotfix',
+        'The authentication fix was deployed to production at 14:00 UTC.',
+        'gotchas',
+      );
+      assert.ok(signals.some(s => s.id === 'shipped'));
+    });
+
+    it('detects "merged into main"', () => {
+      const signals = detectEphemeralSignals(
+        'Feature Complete',
+        'The messaging feature branch was merged into main after the security review.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'shipped'));
+    });
+
+    it('detects "released as v1.2"', () => {
+      const signals = detectEphemeralSignals(
+        'Publish',
+        'The SDK was released as v2.1.0 with the new authentication module.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'shipped'));
+    });
+
+    it('does not flag imperative "deploy to production" instructions', () => {
+      const signals = detectEphemeralSignals(
+        'Deployment Convention',
+        'Always deploy to staging first, then promote to production after smoke tests pass.',
+        'conventions',
+      );
+      assert.ok(!signals.some(s => s.id === 'shipped'));
+    });
+
+    it('does not flag modal "should be deployed to staging" language', () => {
+      const signals = detectEphemeralSignals(
+        'Release Process',
+        'New features should be deployed to staging for at least 24 hours before production.',
+        'conventions',
+      );
+      assert.ok(!signals.some(s => s.id === 'shipped'));
+    });
+  });
+
+  // ── bundling-conjunction ───────────────────────────────────────────────
+
+  describe('bundling-conjunction signal', () => {
+    it('detects ", also" as bundling', () => {
+      const signals = detectEphemeralSignals(
+        'State convention',
+        'ViewModels expose StateFlow, also the reducer must be pure and free of side effects',
+        'conventions',
+      );
+      assert.ok(signals.some(s => s.id === 'bundling-conjunction'), 'Should detect bundling conjunction');
+    });
+
+    it('detects ". Additionally," as bundling', () => {
+      const signals = detectEphemeralSignals(
+        'Build rules',
+        'Must clean build after Tuist changes. Additionally, the scheme must match the target name.',
+        'gotchas',
+      );
+      assert.ok(signals.some(s => s.id === 'bundling-conjunction'));
+    });
+
+    it('detects "Unrelated:" as bundling', () => {
+      const signals = detectEphemeralSignals(
+        'Architecture notes',
+        'Use MVI with standalone reducers. Unrelated: the API client uses Retrofit.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'bundling-conjunction'));
+    });
+
+    it('detects "Separately:" as bundling', () => {
+      const signals = detectEphemeralSignals(
+        'Conventions',
+        'Real prefix over Impl postfix. Separately: avoid lateinit var in ViewModels.',
+        'conventions',
+      );
+      assert.ok(signals.some(s => s.id === 'bundling-conjunction'));
+    });
+
+    it('does not flag "and also" in flowing prose', () => {
+      const signals = detectEphemeralSignals(
+        'StateFlow rule',
+        'ViewModels expose StateFlow and also return sealed interface events for exhaustive handling',
+        'architecture',
+      );
+      assert.ok(!signals.some(s => s.id === 'bundling-conjunction'), 'Mid-sentence "and also" should not fire');
+    });
+
+    it('does not flag "also" at sentence start without preceding comma/semicolon', () => {
+      const signals = detectEphemeralSignals(
+        'Kotlin rule',
+        'Also useful for scoping coroutines to the ViewModel lifecycle',
+        'conventions',
+      );
+      assert.ok(!signals.some(s => s.id === 'bundling-conjunction'), 'Sentence-initial "Also" without comma should not fire');
     });
   });
 
