@@ -7,32 +7,6 @@ describe('normalizeArgs', () => {
   const multiLobe = ['repo-a', 'repo-b'] as const;
 
   describe('param alias resolution', () => {
-    it('resolves "key" to "title"', () => {
-      const result = normalizeArgs('memory_store', { key: 'Test' }, singleLobe);
-      assert.strictEqual(result['title'], 'Test');
-      assert.strictEqual(result['key'], undefined);
-    });
-
-    it('resolves "name" to "title"', () => {
-      const result = normalizeArgs('memory_store', { name: 'Test' }, singleLobe);
-      assert.strictEqual(result['title'], 'Test');
-    });
-
-    it('resolves "value" to "content"', () => {
-      const result = normalizeArgs('memory_store', { value: 'some text' }, singleLobe);
-      assert.strictEqual(result['content'], 'some text');
-    });
-
-    it('resolves "body" to "content"', () => {
-      const result = normalizeArgs('memory_store', { body: 'data' }, singleLobe);
-      assert.strictEqual(result['content'], 'data');
-    });
-
-    it('resolves "text" to "content"', () => {
-      const result = normalizeArgs('memory_store', { text: 'hello' }, singleLobe);
-      assert.strictEqual(result['content'], 'hello');
-    });
-
     it('resolves "query" to "filter"', () => {
       const result = normalizeArgs('memory_query', { query: 'MVI' }, singleLobe);
       assert.strictEqual(result['filter'], 'MVI');
@@ -64,8 +38,8 @@ describe('normalizeArgs', () => {
     });
 
     it('does not overwrite existing canonical param', () => {
-      const result = normalizeArgs('memory_store', { key: 'aliased', title: 'canonical' }, singleLobe);
-      assert.strictEqual(result['title'], 'canonical');
+      const result = normalizeArgs('memory_store', { refs: ['a.kt'], references: ['b.kt'] }, singleLobe);
+      assert.deepStrictEqual(result['references'], ['b.kt']);
     });
   });
 

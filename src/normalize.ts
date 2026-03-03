@@ -7,11 +7,6 @@
 /** Canonical param name aliases — maps guessed names to their correct form */
 const PARAM_ALIASES: Record<string, string> = {
   // memory_store aliases
-  key: 'title',
-  name: 'title',
-  value: 'content',
-  body: 'content',
-  text: 'content',
   refs: 'references',
   // memory_query aliases
   query: 'filter',

@@ -1,0 +1,136 @@
+---
+name: design test suite
+description: Design a structured manual agentic test plan for any tool, MCP, API, or feature
+mode: write
+---
+
+Design a structured manual test plan for the tool, MCP, feature, or capability the user describes. If no description was provided, ask for one before proceeding.
+
+The plan must be saved as a markdown file — ask the user where to save it if not obvious from context.
+
+---
+
+## Two modes
+
+Choose based on what the user is testing:
+
+- **Capability test** — verifies the tool works correctly across a range of inputs. Uses mechanical suites (exact steps) and behavioral scenarios (open-ended). The CONTINUOUS_TEST_PLAN.md in this repo is an example.
+- **Hypothesis validation** — tests a specific assumption about agent behavior (e.g., "do agents act on warnings?", "does the tool description change phrasing?"). Uses isolated, single-hypothesis suites with pure transcript evaluation. The TIER1_VALIDATION_PLAN.md in this repo is an example.
+
+---
+
+## Critical design rules
+
+These apply to both modes and are derived from observed test failures.
+
+### Never embed debrief questions in Part 1
+
+Agents read the full instructions before executing. Any question like "did you notice X?" or "did you phrase it as Y?" tells the agent what to look for before they start — which contaminates the exact behavior you're measuring.
+
+**In capability tests:** deliver debrief questions as separate evaluator prompts, pasted to the agent after each suite or scenario completes.
+
+**In hypothesis validation tests:** use no debrief at all in Part 1. Ask at most one targeted question post-suite, after cleanup. The question must not name the axis being measured (e.g., ask "what influenced how you phrased it?" not "did you use present tense?").
+
+### Use a single session with contamination controls, not separate sessions per scenario
+
+Fresh sessions eliminate prior-context contamination but also eliminate useful learning contamination. A single session with ordering controls and per-scenario cleanup is strictly better:
+
+- Put schema/mechanical tests first — agents learn the correct API shape before behavioral tests run, eliminating first-attempt schema failures
+- Put warning-mechanics tests after behavioral tests — agents won't have seen warning patterns before making natural judgment calls
+- Use cleanup commands between scenarios to prevent stored entries from cross-contaminating retrieval results
+
+### Tags with underscores are normalized
+
+`tags: ["_test"]` is stored and queried as `test` (underscore stripped). Cleanup filters must use `#test` not `#_test`. Document this explicitly in the cleanup command.
+
+### Evaluation is transcript-first
+
+Most agent behavior is directly observable from tool call order, stored content, and response text. Read the transcript before asking the agent anything. Post-suite debrief supplements only what the transcript cannot show — internal reasoning, intent, whether a specific factor influenced a decision.
+
+---
+
+## Structure
+
+The plan has two clearly separated parts. Part 2 must never be shared with the agent running the tests.
+
+---
+
+### Part 1 — Agent Instructions
+
+Everything in Part 1 is written for an agent who knows nothing about what is being evaluated. No hints about correct behavior, evaluation axes, or signals to watch for.
+
+#### Overview
+
+A brief intro so the agent understands:
+- What the tool or system is and what it's for
+- That this session runs several independent scenarios
+- That they should use the tools however makes sense to them in each scenario
+- The tagging requirement for cleanup (if applicable)
+
+#### Cleanup command
+
+If entries need to be cleaned up between suites, define the cleanup command once upfront. Note the normalized tag form explicitly (e.g., "tags: ['_test'] are stored as 'test' — use filter '#test'").
+
+#### Mechanical suite(s)
+
+One or more suites of exact, ordered steps. Each step is a specific call or action. Include:
+- Steps that test correct behavior (expected to succeed)
+- Steps that test rejection of bad input — tell the agent some steps intentionally test failure cases, so they don't panic
+- A **cleanup block** at the end (not a self-grade block)
+
+Do not include questions at the end of mechanical suites. The evaluator reads the transcript.
+
+#### Behavioral scenarios
+
+Open-ended scenarios where the agent acts as a practitioner. Each scenario:
+- Gives realistic context and a clear task
+- Contains no hints about what correct behavior looks like
+- Ends with a **cleanup block** (not a self-grade block)
+
+The evaluator delivers debrief questions separately after each scenario completes.
+
+---
+
+### Part 2 — Evaluation Criteria
+
+Clearly marked "do not share with the test agent."
+
+#### Contamination notes
+
+Document expected and accepted contamination between suites:
+- What knowledge earlier suites teach that later suites may build on (acceptable)
+- What earlier suites reveal that could prime behavior in later suites (flag, note impact on scoring)
+
+#### Mechanical suite rubric
+
+A table per suite: test ID, pass condition, fail condition. Be specific — exact strings to look for in the transcript, exact tool call patterns that indicate pass vs. fail.
+
+#### Behavioral scenario rubric
+
+A 1–3 scale per scenario:
+- 3: Correct behavior, unprompted
+- 2: Correct behavior after the agent self-corrects or responds to a signal from the tool
+- 1: Incorrect behavior despite available signals, or signals misfired
+
+For each scenario: what to look for in the transcript, and — if a post-suite debrief question is used — what the answer reveals about whether the agent understood why it got the right result.
+
+#### Post-suite debrief questions (evaluator-only)
+
+List the exact debrief questions to ask after each scenario, with interpretation guidance. These are not included in Part 1 — the evaluator pastes them after each suite completes.
+
+One question per scenario maximum. The question should probe intent or reasoning that the transcript cannot show on its own.
+
+---
+
+## Hypothesis validation structure (alternative)
+
+When testing a specific behavioral assumption, the structure simplifies:
+
+**Part 1:** Task only. No debrief, no self-grade, no framing that hints at the measurement axis.
+
+**Part 2:**
+- State the hypothesis explicitly: what is assumed to be true, what would refute it
+- Evaluation is purely from transcript: what tool calls appear in what order, what content was stored, whether specific calls appear or don't appear after specific events
+- One optional post-suite debrief question, listed in Part 2 with interpretation guidance, delivered by the evaluator after cleanup
+
+**W3-class tests (testing a specific failure mode):** Design the scenario so the failure mode is guaranteed to occur — don't give the agent room to avoid it through good judgment. If you're testing whether a warning prompts correction, force content that will trigger the warning. If the agent bypasses it by being careful, the test is untestable, not passed.

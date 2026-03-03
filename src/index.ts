@@ -239,7 +239,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     // and memory_stats. The handler still works if called directly.
     {
       name: 'memory_store',
-      description: 'Store knowledge. "user" and "preferences" are global (no lobe needed). Use tags for exact-match categorization. Add a shared tag (e.g., "test-entry") for bulk operations. Example: memory_store(topic: "gotchas", title: "Build cache", content: "Must clean build after Tuist changes", tags: ["build", "ios"])',
+      // Example comes first — agents form their call shape from the first concrete pattern they see.
+      // "entries" (not "content") signals a collection; fighting the "content = string" prior
+      // is an architectural fix rather than patching the description after the fact.
+      description: 'memory_store(topic: "gotchas", entries: [{title: "Build cache", fact: "Must clean build after Tuist changes"}, {title: "Tuist version", fact: "Project requires Tuist 4.x"}], tags: ["build"]). Stores enduring knowledge — (1) Codebase facts (architecture, conventions, gotchas, modules): what IS true now, not past actions. Wrong: "Completed migration to StateFlow." Right: "All ViewModels use StateFlow." (2) User knowledge (user, preferences): who the person is, how they work. "user" and "preferences" are global. One insight per object; use multiple objects instead of bundling.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -252,13 +255,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: 'Predefined: user | preferences | architecture | conventions | gotchas | recent-work. Custom namespace: modules/<name> (e.g. modules/brainstorm, modules/game-design, modules/api-notes). Use modules/<name> for any domain that doesn\'t fit the built-in topics.',
             enum: ['user', 'preferences', 'architecture', 'conventions', 'gotchas', 'recent-work'],
           },
-          title: {
-            type: 'string',
-            description: 'Short title for this entry',
-          },
-          content: {
-            type: 'string',
-            description: 'The knowledge to store',
+          entries: {
+            type: 'array',
+            // Type annotation first — agents trained on code read type signatures before prose.
+            description: 'Array<{title: string, fact: string}> — not a string. One object per insight. title: short label (2-5 words). fact: codebase topics → present-tense state ("X uses Y", not "Completed X"); user/preferences → what the person expressed. Wrong: one object bundling two facts. Right: two objects.',
+            items: {
+              type: 'object',
+              properties: {
+                title: {
+                  type: 'string',
+                  description: 'Short label for this insight (2-5 words)',
+                },
+                fact: {
+                  type: 'string',
+                  description: 'The insight itself — one focused fact or observation',
+                },
+              },
+              required: ['title', 'fact'],
+            },
+            minItems: 1,
           },
           sources: {
             type: 'array',
@@ -285,7 +300,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             default: [],
           },
         },
-        required: ['topic', 'title', 'content'],
+        required: ['topic', 'entries'],
       },
     },
     {
@@ -456,11 +471,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'memory_store': {
-        const { lobe: rawLobe, topic: rawTopic, title, content, sources, references, trust: rawTrust, tags: rawTags } = z.object({
+        const { lobe: rawLobe, topic: rawTopic, entries: rawEntries, sources, references, trust: rawTrust, tags: rawTags } = z.object({
           lobe: z.string().optional(),
           topic: z.string(),
-          title: z.string().min(1),
-          content: z.string().min(1),
+          // Accept a bare {title, fact} object in addition to the canonical array form.
+          // Only objects are auto-wrapped — strings and other primitives still fail with
+          // a type error, preserving the "validate at boundaries" invariant.
+          entries: z.preprocess(
+            (val) => (val !== null && !Array.isArray(val) && typeof val === 'object' ? [val] : val),
+            z.array(z.object({
+              title: z.string().min(1),
+              fact: z.string().min(1),
+            })).min(1),
+          ),
           sources: z.array(z.string()).default([]),
           references: z.array(z.string()).default([]),
           trust: z.enum(['user', 'agent-confirmed', 'agent-inferred']).default('agent-inferred'),
@@ -491,67 +514,80 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const ctx = resolveToolContext(effectiveLobe, { isGlobal });
         if (!ctx.ok) return contextError(ctx);
 
-        const result = await ctx.store.store(
-          topic,
-          title,
-          content,
-          sources,
-          // User/preferences default to 'user' trust unless explicitly set otherwise
-          isGlobal && trust === 'agent-inferred' ? 'user' : trust,
-          references,
-          rawTags,
-        );
+        const effectiveTrust = isGlobal && trust === 'agent-inferred' ? 'user' : trust;
 
-        if (!result.stored) {
-          return {
-            content: [{ type: 'text', text: `[${ctx.label}] Failed to store: ${result.warning}` }],
-            isError: true,
-          };
+        // Store each entry and collect results — typed to the success branch only
+        // (early return above handles the failure case, so only stored:true entries reach the array)
+        type StoreSuccess = Extract<Awaited<ReturnType<typeof ctx.store.store>>, { stored: true }>;
+        const storedResults: Array<{ title: string; result: StoreSuccess }> = [];
+        for (const { title, fact } of rawEntries) {
+          const result = await ctx.store.store(topic, title, fact, sources, effectiveTrust, references, rawTags);
+          if (!result.stored) {
+            return {
+              content: [{ type: 'text', text: `[${ctx.label}] Failed to store "${title}": ${result.warning}` }],
+              isError: true,
+            };
+          }
+          storedResults.push({ title, result });
         }
 
-        const lines: string[] = [
-          `[${ctx.label}] Stored entry ${result.id} in ${result.topic} (confidence: ${result.confidence})`,
-        ];
-        if (result.warning) lines.push(`Note: ${result.warning}`);
+        // Build response header
+        const lines: string[] = [];
+        if (storedResults.length === 1) {
+          const { result } = storedResults[0];
+          lines.push(`[${ctx.label}] Stored entry ${result.id} in ${result.topic} (confidence: ${result.confidence})`);
+          if (result.warning) lines.push(`Note: ${result.warning}`);
+        } else {
+          const { result: first } = storedResults[0];
+          lines.push(`[${ctx.label}] Stored ${storedResults.length} entries in ${first.topic} (confidence: ${first.confidence}):`);
+          for (const { title, result } of storedResults) {
+            lines.push(`  - ${result.id}: "${title}"`);
+          }
+        }
 
         // Limit to at most 2 hint sections per response to prevent hint fatigue.
         // Priority: dedup > ephemeral > preferences (dedup is actionable and high-signal,
         // ephemeral warnings affect entry quality, preferences are informational).
+        // For multi-entry batches, hints reference the first triggering entry.
         let hintCount = 0;
 
-        // Dedup: surface related entries in the same topic
-        if (result.relatedEntries && result.relatedEntries.length > 0 && hintCount < 2) {
-          hintCount++;
-          lines.push('');
-          lines.push('⚠ Similar entries found in the same topic:');
-          for (const r of result.relatedEntries) {
-            lines.push(`  - ${r.id}: "${r.title}" (confidence: ${r.confidence})`);
-            lines.push(`    Content: ${r.content.length > 120 ? r.content.substring(0, 120) + '...' : r.content}`);
+        for (const { title, result } of storedResults) {
+          const entryPrefix = storedResults.length > 1 ? `"${title}": ` : '';
+
+          // Dedup: surface related entries in the same topic
+          if (result.relatedEntries && result.relatedEntries.length > 0 && hintCount < 2) {
+            hintCount++;
+            lines.push('');
+            lines.push(`⚠ ${entryPrefix}Similar entries found in the same topic:`);
+            for (const r of result.relatedEntries) {
+              lines.push(`  - ${r.id}: "${r.title}" (confidence: ${r.confidence})`);
+              lines.push(`    Content: ${r.content.length > 120 ? r.content.substring(0, 120) + '...' : r.content}`);
+            }
+            lines.push('');
+            lines.push('To consolidate: memory_correct(id: "<old-id>", action: "replace", correction: "<merged content>") then memory_correct(id: "<new-id>", action: "delete")');
           }
-          lines.push('');
-          lines.push('To consolidate: memory_correct(id: "<old-id>", action: "replace", correction: "<merged content>") then memory_correct(id: "<new-id>", action: "delete")');
-        }
 
-        // Ephemeral content warning — soft nudge, never blocking
-        if (result.ephemeralWarning && hintCount < 2) {
-          hintCount++;
-          lines.push('');
-          lines.push(`⏳ ${result.ephemeralWarning}`);
-        }
-
-        // Preference surfacing: show relevant preferences for non-preference entries
-        if (result.relevantPreferences && result.relevantPreferences.length > 0 && hintCount < 2) {
-          hintCount++;
-          lines.push('');
-          lines.push('📌 Relevant preferences:');
-          for (const p of result.relevantPreferences) {
-            lines.push(`  - [pref] ${p.title}: ${p.content.length > 120 ? p.content.substring(0, 120) + '...' : p.content}`);
+          // Ephemeral content warning — soft nudge, never blocking
+          if (result.ephemeralWarning && hintCount < 2) {
+            hintCount++;
+            lines.push('');
+            lines.push(`⏳ ${entryPrefix}${result.ephemeralWarning}`);
           }
-          lines.push('');
-          lines.push('Review the stored entry against these preferences for potential conflicts.');
+
+          // Preference surfacing: show relevant preferences for non-preference entries
+          if (result.relevantPreferences && result.relevantPreferences.length > 0 && hintCount < 2) {
+            hintCount++;
+            lines.push('');
+            lines.push(`📌 ${entryPrefix}Relevant preferences:`);
+            for (const p of result.relevantPreferences) {
+              lines.push(`  - [pref] ${p.title}: ${p.content.length > 120 ? p.content.substring(0, 120) + '...' : p.content}`);
+            }
+            lines.push('');
+            lines.push('Review the stored entry against these preferences for potential conflicts.');
+          }
         }
 
-        // Vocabulary echo: show existing tags to drive convergence
+        // Vocabulary echo: show existing tags to drive convergence (once per response)
         if (hintCount < 2) {
           const tagFreq = ctx.store.getTagFrequency();
           if (tagFreq.size > 0) {
@@ -1144,8 +1180,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (message.includes('"lobe"') && message.includes('Required')) {
       const lobeNames = configManager.getLobeNames();
       hint = `\n\nHint: lobe is required. Use memory_list_lobes to see available lobes. Available: ${lobeNames.join(', ')}`;
-    } else if (message.includes('"topic"') || message.includes('"title"') || message.includes('"content"')) {
-      hint = '\n\nHint: memory_store requires: topic (architecture|conventions|gotchas|recent-work|modules/<name>), title, content. Use modules/<name> for custom namespaces (e.g. modules/brainstorm, modules/game-design).';
+    } else if (message.includes('"topic"') || message.includes('"entries"')) {
+      hint = '\n\nHint: memory_store requires: topic (architecture|conventions|gotchas|recent-work|modules/<name>) and entries (Array<{title, fact}>). Example: entries: [{title: "Build cache", fact: "Must clean build after Tuist changes"}]. Use modules/<name> for custom namespaces.';
     } else if (message.includes('"scope"')) {
       hint = '\n\nHint: memory_query requires: lobe, scope (architecture|conventions|gotchas|recent-work|modules/<name>|* for all)';
     }
