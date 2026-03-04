@@ -7,7 +7,7 @@ import type { MemoryStats, StaleEntry, ConflictPair, BehaviorConfig } from './ty
 import {
   DEFAULT_STALE_DAYS_STANDARD, DEFAULT_STALE_DAYS_PREFERENCES,
   DEFAULT_MAX_STALE_IN_BRIEFING, DEFAULT_MAX_DEDUP_SUGGESTIONS, DEFAULT_MAX_CONFLICT_PAIRS,
-  MAX_FOOTER_TAGS,
+  MAX_FOOTER_TAGS, WARN_SEPARATOR,
 } from './thresholds.js';
 import { analyzeFilterGroups, type FilterGroup, type QueryMode } from './text-analyzer.js';
 import type { MarkdownMemoryStore } from './store.js';
@@ -26,23 +26,33 @@ export function formatStaleSection(staleDetails: readonly StaleEntry[]): string 
 
 /** Format the conflict detection warning for query/context responses */
 export function formatConflictWarning(conflicts: readonly ConflictPair[]): string {
-  const lines = ['⚠ Potential conflicts detected:'];
+  const lines = [
+    WARN_SEPARATOR,
+    '⚠  CONFLICTING ENTRIES DETECTED — ACTION NEEDED  ⚠',
+    WARN_SEPARATOR,
+  ];
   for (const c of conflicts) {
-    lines.push(`  - ${c.a.id}: "${c.a.title}" (confidence: ${c.a.confidence}, created: ${c.a.created.substring(0, 10)})`);
-    lines.push(`    vs ${c.b.id}: "${c.b.title}" (confidence: ${c.b.confidence}, created: ${c.b.created.substring(0, 10)})`);
-    lines.push(`    Similarity: ${(c.similarity * 100).toFixed(0)}%`);
+    lines.push(`  ${c.a.id}: "${c.a.title}" (confidence: ${c.a.confidence}, ${c.a.created.substring(0, 10)})`);
+    lines.push(`    vs`);
+    lines.push(`  ${c.b.id}: "${c.b.title}" (confidence: ${c.b.confidence}, ${c.b.created.substring(0, 10)})`);
+    lines.push(`  Similarity: ${(c.similarity * 100).toFixed(0)}%`);
+    lines.push('');
 
-    // Guide the agent on which entry to trust
+    // Pre-fill which entry to delete so the agent can act immediately.
     if (c.a.confidence !== c.b.confidence) {
-      const higher = c.a.confidence > c.b.confidence ? c.a : c.b;
-      lines.push(`    Higher confidence: ${higher.id} (${higher.confidence})`);
+      const keep = c.a.confidence > c.b.confidence ? c.a : c.b;
+      const remove = c.a.confidence > c.b.confidence ? c.b : c.a;
+      lines.push(`  Trust ${keep.id} (higher confidence). Delete the lower-confidence entry:`);
+      lines.push(`  memory_correct(id: "${remove.id}", action: "delete")`);
     } else {
-      const newer = c.a.created > c.b.created ? c.a : c.b;
-      lines.push(`    More recent: ${newer.id} — may supersede the older entry`);
+      const keep = c.a.created > c.b.created ? c.a : c.b;
+      const remove = c.a.created > c.b.created ? c.b : c.a;
+      lines.push(`  ${keep.id} is more recent — may supersede ${remove.id}:`);
+      lines.push(`  memory_correct(id: "${remove.id}", action: "delete")`);
     }
+    lines.push('');
   }
-  lines.push('');
-  lines.push('Consider: memory_correct to consolidate or clarify the difference between these entries.');
+  lines.push(WARN_SEPARATOR);
   return lines.join('\n');
 }
 

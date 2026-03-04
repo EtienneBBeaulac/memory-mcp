@@ -36,7 +36,7 @@ import { realGitService } from './git-service.js';
 import {
   extractKeywords, stem, similarity, matchesFilter, computeRelevanceScore,
 } from './text-analyzer.js';
-import { detectEphemeralSignals, formatEphemeralWarning } from './ephemeral.js';
+import { detectEphemeralSignals, formatEphemeralWarning, getEphemeralSeverity } from './ephemeral.js';
 
 // Used only by bootstrap() for git log — not part of the GitService boundary
 // because bootstrap is a one-shot utility, not a recurring operation
@@ -143,10 +143,13 @@ export class MarkdownMemoryStore {
     const ephemeralSignals = topic !== 'recent-work'
       ? detectEphemeralSignals(title, content, topic)
       : [];
-    const ephemeralWarning = formatEphemeralWarning(ephemeralSignals);
+    // getEphemeralSeverity is the single source of threshold logic shared with formatEphemeralWarning.
+    const ephemeralSeverity = getEphemeralSeverity(ephemeralSignals);
+    const ephemeralWarning = formatEphemeralWarning(ephemeralSignals, id);
 
     return {
       stored: true, id, topic, file, confidence, warning, ephemeralWarning,
+      ephemeralSeverity: ephemeralSeverity ?? undefined,
       relatedEntries: relatedEntries.length > 0 ? relatedEntries : undefined,
       relevantPreferences: relevantPreferences && relevantPreferences.length > 0 ? relevantPreferences : undefined,
     };

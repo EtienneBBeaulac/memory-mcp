@@ -19,7 +19,8 @@
 import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import type { TopicScope } from './types.js';
+import type { EphemeralSeverity, TopicScope } from './types.js';
+import { WARN_SEPARATOR } from './thresholds.js';
 
 // ─── TF-IDF Classifier ────────────────────────────────────────────────────
 // Lightweight logistic regression over TF-IDF features. Trained on 400+
@@ -593,6 +594,7 @@ const SIGNALS: readonly SignalDefinition[] = [
     test: (_title, content) => {
       const patterns = [
         /[,;]\s+also\b/i,             // "X works this way, also Y does Z"
+        /[.!?]\s+also[,\s]/i,         // ". Also, Y does Z" (sentence-start also)
         /[.!?]\s+additionally,/i,      // ". Additionally, ..."
         /[.!?]\s+furthermore,/i,       // ". Furthermore, ..."
         /\bunrelated:/i,               // "Unrelated: ..."
@@ -672,31 +674,70 @@ export function detectEphemeralSignals(
   return signals;
 }
 
-/** Format ephemeral signals into a human-readable warning string.
- *  Returns undefined if no signals were detected. */
-export function formatEphemeralWarning(signals: readonly EphemeralSignal[]): string | undefined {
-  if (signals.length === 0) return undefined;
-
+/** Derive aggregate severity from a set of detected signals.
+ *  Single source of truth for the threshold logic — both formatEphemeralWarning
+ *  and store.ts call this so the thresholds can only diverge in one place. */
+export function getEphemeralSeverity(signals: readonly EphemeralSignal[]): EphemeralSeverity | null {
+  if (signals.length === 0) return null;
   const highCount = signals.filter(s => s.confidence === 'high').length;
-  const severity = highCount >= 2 ? 'likely contains' : highCount === 1 ? 'possibly contains' : 'may contain';
+  if (highCount >= 2) return 'high';
+  if (highCount === 1) return 'medium';
+  return 'low';
+}
 
-  const lines = [
-    `This entry ${severity} ephemeral content:`,
-    ...signals.map(s => `  - ${s.label}: ${s.detail}`),
-    '',
-  ];
+/** Format ephemeral signals into a visually prominent warning block.
+ *  Returns undefined if no signals were detected. */
+export function formatEphemeralWarning(signals: readonly EphemeralSignal[], entryId: string): string | undefined {
+  const severity = getEphemeralSeverity(signals);
+  if (severity === null) return undefined;
 
-  // Scale the guidance with confidence — high-confidence gets direct advice,
-  // low-confidence gets a softer suggestion to let the agent decide.
-  // Always include the positive redirect: store state, not events.
-  if (highCount >= 2) {
-    lines.push('This is almost certainly session-specific. Consider deleting after your session.');
-    lines.push('If there is a lasting insight here, rephrase it as a present-tense fact: what is now true about the codebase?');
-  } else if (highCount === 1) {
-    lines.push('If this is a lasting insight, rephrase it as a present-tense fact (what is now true) rather than an action report (what you did). If session-specific, consider deleting after your session.');
-  } else {
-    lines.push('If this is durable knowledge, rephrase as a present-tense fact: what is now true? If it describes what you did rather than what is, consider deleting after your session.');
+  const signalLines = signals.map(s => `  - ${s.label}: ${s.detail}`).join('\n');
+  // Delete command without leading spaces — callsites add their own indentation.
+  const deleteCmd = `memory_correct(id: "${entryId}", action: "delete")`;
+
+  // Scale both the header and guidance text with severity.
+  // high:   near-certain ephemeral → "ACTION REQUIRED" + prominent DELETE label.
+  // medium: likely ephemeral → "REVIEW NEEDED" + delete as an option.
+  // low:    uncertain → "CHECK BELOW" + softest framing.
+  switch (severity) {
+    case 'high':
+      return [
+        WARN_SEPARATOR,
+        '⚠  EPHEMERAL CONTENT — ACTION REQUIRED  ⚠',
+        WARN_SEPARATOR,
+        signalLines,
+        '',
+        'Will this still be true in 6 months? Almost certainly not.',
+        '',
+        `DELETE:  ${deleteCmd}`,
+        '',
+        'If there is a lasting insight here, extract and rephrase',
+        'it as a present-tense fact before deleting this entry.',
+        WARN_SEPARATOR,
+      ].join('\n');
+    case 'medium':
+      return [
+        WARN_SEPARATOR,
+        '⚠  POSSIBLY EPHEMERAL CONTENT — REVIEW NEEDED  ⚠',
+        WARN_SEPARATOR,
+        signalLines,
+        '',
+        'Will this still be true in 6 months?',
+        `  - If not:  ${deleteCmd}`,
+        `  - If so:   rephrase as a present-tense fact (what is now true)`,
+        WARN_SEPARATOR,
+      ].join('\n');
+    case 'low':
+      return [
+        WARN_SEPARATOR,
+        '⚠  POSSIBLY EPHEMERAL CONTENT — CHECK BELOW  ⚠',
+        WARN_SEPARATOR,
+        signalLines,
+        '',
+        'Ask: will this still be true in 6 months?',
+        `  - If not:  ${deleteCmd}`,
+        `  - If so:   rephrase as a present-tense fact if possible`,
+        WARN_SEPARATOR,
+      ].join('\n');
   }
-
-  return lines.join('\n');
 }

@@ -593,60 +593,70 @@ describe('ephemeral detection', () => {
 
   describe('formatEphemeralWarning', () => {
     it('returns undefined for empty signals', () => {
-      assert.strictEqual(formatEphemeralWarning([]), undefined);
+      assert.strictEqual(formatEphemeralWarning([], 'conv-test'), undefined);
     });
 
-    it('formats a single high-confidence signal', () => {
+    it('formats a single high-confidence signal with visual border and delete command', () => {
       const result = formatEphemeralWarning([
         { id: 'temporal', label: 'Temporal language', detail: 'contains "currently"', confidence: 'high' },
-      ]);
+      ], 'conv-abc123');
       assert.ok(result);
-      assert.ok(result.includes('possibly contains'), 'Single high = "possibly contains"');
-      assert.ok(result.includes('Temporal language'));
-      assert.ok(result.includes('currently'));
+      assert.ok(result.includes('===='), 'Should have visual border');
+      assert.ok(result.includes('POSSIBLY EPHEMERAL'), 'Single high = POSSIBLY EPHEMERAL header');
+      assert.ok(result.includes('REVIEW NEEDED'), 'Single high = REVIEW NEEDED header');
+      assert.ok(result.includes('Temporal language'), 'Should include signal label');
+      assert.ok(result.includes('currently'), 'Should include signal detail');
+      assert.ok(result.includes('6 months'), 'Should include the 6-months test');
+      assert.ok(result.includes('conv-abc123'), 'Should pre-fill entry ID in delete command');
+      assert.ok(result.includes('memory_correct'), 'Should include the delete command');
     });
 
-    it('formats multiple high-confidence signals as "likely"', () => {
+    it('formats two high-confidence signals as ACTION REQUIRED', () => {
       const result = formatEphemeralWarning([
         { id: 'temporal', label: 'Temporal language', detail: 'contains "right now"', confidence: 'high' },
         { id: 'stack-trace', label: 'Stack trace', detail: 'contains stack trace', confidence: 'high' },
-      ]);
+      ], 'arch-xyz789');
       assert.ok(result);
-      assert.ok(result.includes('likely contains'), 'Two high = "likely contains"');
+      assert.ok(result.includes('===='), 'Should have visual border');
+      assert.ok(result.includes('ACTION REQUIRED'), 'Two high = ACTION REQUIRED header');
+      assert.ok(result.includes('6 months'), 'Should include the 6-months test');
+      assert.ok(result.includes('arch-xyz789'), 'Should pre-fill entry ID in delete command');
+      assert.ok(result.includes('DELETE:'), 'Should have prominent DELETE label');
     });
 
-    it('formats medium-only signals as "may contain"', () => {
+    it('formats medium-only signals as CHECK BELOW with delete option', () => {
       const result = formatEphemeralWarning([
         { id: 'task-language', label: 'Task language', detail: 'contains "need to"', confidence: 'medium' },
-      ]);
+      ], 'gotcha-med456');
       assert.ok(result);
-      assert.ok(result.includes('may contain'), 'Medium only = "may contain"');
+      assert.ok(result.includes('===='), 'Should have visual border');
+      assert.ok(result.includes('CHECK BELOW'), 'Medium only = CHECK BELOW header');
+      assert.ok(result.includes('6 months'), 'Should include the 6-months test');
+      assert.ok(result.includes('gotcha-med456'), 'Should pre-fill entry ID in delete command');
+      assert.ok(result.includes('memory_correct'), 'Should include delete option');
     });
 
-    it('includes actionable guidance scaled to confidence', () => {
-      // Single high-confidence: moderate advice + present-tense redirect
+    it('includes guidance to rephrase as present-tense fact', () => {
+      // All confidence levels should mention rephrasing as a present-tense fact
       const singleHigh = formatEphemeralWarning([
         { id: 'temporal', label: 'Temporal language', detail: 'contains "today"', confidence: 'high' },
-      ]);
+      ], 'conv-test1');
       assert.ok(singleHigh);
-      assert.ok(singleHigh.includes('lasting insight'), 'Single high should suggest keeping if lasting');
-      assert.ok(singleHigh.includes('present-tense'), 'Single high should redirect to present-tense facts');
+      assert.ok(singleHigh.includes('lasting insight') || singleHigh.includes('present-tense fact'),
+        'Single high should mention present-tense rephrase option');
 
-      // Two high-confidence: strong advice + present-tense redirect
       const twoHigh = formatEphemeralWarning([
         { id: 'temporal', label: 'Temporal', detail: 'contains "today"', confidence: 'high' },
         { id: 'stack-trace', label: 'Stack trace', detail: 'stack trace detected', confidence: 'high' },
-      ]);
+      ], 'conv-test2');
       assert.ok(twoHigh);
-      assert.ok(twoHigh.includes('almost certainly session-specific'), 'Two high should strongly advise deletion');
       assert.ok(twoHigh.includes('present-tense'), 'Two high should redirect to present-tense facts');
 
-      // Medium-only: soft advice + present-tense redirect
       const mediumOnly = formatEphemeralWarning([
         { id: 'uncertainty', label: 'Uncertain', detail: 'contains "maybe"', confidence: 'medium' },
-      ]);
+      ], 'conv-test3');
       assert.ok(mediumOnly);
-      assert.ok(mediumOnly.includes('present-tense'), 'Medium-only should still redirect to present-tense facts');
+      assert.ok(mediumOnly.includes('present-tense fact'), 'Medium-only should still redirect to present-tense facts');
     });
   });
 
@@ -979,13 +989,22 @@ describe('ephemeral detection', () => {
       assert.ok(!signals.some(s => s.id === 'bundling-conjunction'), 'Mid-sentence "and also" should not fire');
     });
 
-    it('does not flag "also" at sentence start without preceding comma/semicolon', () => {
+    it('detects ". Also," as bundling (sentence-start also after period)', () => {
+      const signals = detectEphemeralSignals(
+        'State conventions',
+        'Use StateFlow for all UI state. Also, the Real prefix is always used instead of Impl.',
+        'conventions',
+      );
+      assert.ok(signals.some(s => s.id === 'bundling-conjunction'), '". Also," after a sentence should fire');
+    });
+
+    it('does not flag content-initial "Also" with no preceding sentence boundary', () => {
       const signals = detectEphemeralSignals(
         'Kotlin rule',
         'Also useful for scoping coroutines to the ViewModel lifecycle',
         'conventions',
       );
-      assert.ok(!signals.some(s => s.id === 'bundling-conjunction'), 'Sentence-initial "Also" without comma should not fire');
+      assert.ok(!signals.some(s => s.id === 'bundling-conjunction'), 'Content-initial "Also" with no preceding punctuation should not fire');
     });
   });
 
