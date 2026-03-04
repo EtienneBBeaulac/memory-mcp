@@ -325,6 +325,9 @@ const EPHEMERAL_CASES: readonly BenchmarkCase[] = [
   { title: 'Doc Sprint', content: '14 docs modified to reflect the new Prosthetics module split.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['diff-stats'] },
   { title: 'Dead Code Pass', content: '42 files changed during the dead code removal. Bundle size reduced by 18kb.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['diff-stats'] },
 
+  // ── NEW: Bundling conjunction (sentence-start "Also") ────────────────
+  { title: 'Multi-fact bundle', content: 'Use StateFlow for all UI state. Also, the Real prefix is always used instead of Impl.', topic: 'conventions', label: 'ephemeral', expectedSignals: ['bundling-conjunction'] },
+
   // ── NEW: Remaining/open-items in work summaries ───────────────────────
   { title: 'Migration Status', content: 'Core migration is done. Remaining: update all downstream consumers, add integration tests.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['task-language'] },
   { title: 'Feature Wrap-up', content: 'Most features shipped. Open items: analytics integration, dark mode toggle, accessibility audit.', topic: 'architecture', label: 'ephemeral', expectedSignals: ['task-language'] },

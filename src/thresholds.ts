@@ -51,15 +51,6 @@ export const OPPOSITION_PAIRS: ReadonlyArray<readonly [string, string]> = [
 /** Score multiplier when a reference path basename matches the context keywords. */
 export const REFERENCE_BOOST_MULTIPLIER = 1.30;
 
-/** Score multiplier applied to weak cross-lobe results in multi-lobe context search.
- *  Prevents generic software terms (e.g. "codebase", "structure") from surfacing
- *  entries from unrelated repos with high confidence/topic-boost scores. */
-export const CROSS_LOBE_WEAK_SCORE_PENALTY = 0.50;
-
-/** Fraction of context keywords an entry must match to avoid the cross-lobe penalty.
- *  E.g. 0.40 means an entry must match at least 40% of the context keywords (minimum 2)
- *  to be treated as a strong cross-lobe match. */
-export const CROSS_LOBE_MIN_MATCH_RATIO = 0.40;
 
 /** Per-topic scoring boost factors for contextSearch().
  *  Higher = more likely to surface for any given context. */
@@ -110,3 +101,9 @@ export const VOCABULARY_ECHO_LIMIT = 8;
 
 /** Maximum tags shown in query/context footer. */
 export const MAX_FOOTER_TAGS = 12;
+
+// ─── Display formatting constants ───────────────────────────────────────────
+
+/** Visual separator for warning blocks in tool responses.
+ *  Width chosen to stand out as a block boundary in any terminal or chat rendering. */
+export const WARN_SEPARATOR = '='.repeat(52);

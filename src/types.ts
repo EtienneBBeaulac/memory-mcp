@@ -8,6 +8,10 @@
 /** Trust levels for knowledge sources, ordered by reliability */
 export type TrustLevel = 'user' | 'agent-confirmed' | 'agent-inferred';
 
+/** Ephemeral detection severity — three distinct levels so consumers can branch exhaustively.
+ *  Separated from EphemeralSignal.confidence to represent the aggregate outcome of all signals. */
+export type EphemeralSeverity = 'high' | 'medium' | 'low';
+
 const TRUST_LEVELS: readonly TrustLevel[] = ['user', 'agent-confirmed', 'agent-inferred'];
 
 /** Parse a raw string into a TrustLevel, returning null for invalid input */
@@ -163,6 +167,8 @@ export type StoreResult =
       readonly warning?: string;
       /** Soft warning when content looks ephemeral — informational, never blocking */
       readonly ephemeralWarning?: string;
+      /** Aggregate severity of all ephemeral signals that fired — absent when none fired */
+      readonly ephemeralSeverity?: EphemeralSeverity;
       readonly relatedEntries?: readonly RelatedEntry[];
       readonly relevantPreferences?: readonly RelatedEntry[];
     }

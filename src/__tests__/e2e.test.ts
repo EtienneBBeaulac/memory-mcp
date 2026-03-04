@@ -837,8 +837,8 @@ describe('E2E: MCP Server', () => {
       assert.ok(!client.isError(resp), `Store should succeed: ${client.getText(resp)}`);
       const text = client.getText(resp);
       assert.ok(text.includes('Stored entry'), 'Entry should be stored (soft warning, not blocked)');
-      assert.ok(text.includes('⏳'), 'Should include ephemeral warning marker');
-      assert.ok(text.includes('ephemeral'), 'Should mention ephemeral content');
+      assert.ok(text.includes('EPHEMERAL'), 'Should include ephemeral warning block');
+      assert.ok(text.includes('6 months'), 'Should include the 6-months test');
 
       // Clean up
       const idMatch = text.match(/(gotcha-[0-9a-f]+)/);
@@ -853,8 +853,8 @@ describe('E2E: MCP Server', () => {
       });
       assert.ok(!client.isError(resp));
       const text = client.getText(resp);
-      assert.ok(text.includes('⏳'), 'Should include ephemeral warning for fixed bugs');
-      assert.ok(text.includes('Resolved issue') || text.includes('resolved'), 'Should flag resolved issues');
+      assert.ok(text.includes('EPHEMERAL') || text.includes('6 months'), 'Should include ephemeral warning for fixed bugs');
+      assert.ok(text.includes('memory_correct'), 'Should include delete command in warning');
 
       const idMatch = text.match(/(gotcha-[0-9a-f]+)/);
       if (idMatch) await client.callTool('memory_correct', { id: idMatch[1], action: 'delete' });
