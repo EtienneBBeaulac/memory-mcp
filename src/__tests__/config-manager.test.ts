@@ -30,6 +30,7 @@ describe('ConfigManager', () => {
       repoRoot: '/fake/repo',
       memoryPath: '/fake/memory',
       storageBudgetBytes: 2 * 1024 * 1024,
+      alwaysInclude: false,
     };
 
     initialConfig = {
@@ -169,6 +170,67 @@ describe('ConfigManager', () => {
       const config = manager.getLobeConfig('test-lobe');
       assert.ok(config !== undefined);
       assert.equal(config.repoRoot, '/fake/repo');
+    });
+  });
+
+  describe('getAlwaysIncludeLobes', () => {
+    it('returns empty when no lobes have alwaysInclude', () => {
+      const manager = new ConfigManager(configPath, initialConfig, initialStores, initialHealth);
+      assert.deepEqual(manager.getAlwaysIncludeLobes(), []);
+    });
+
+    it('returns lobes with alwaysInclude: true', () => {
+      const globalConfig: MemoryConfig = {
+        repoRoot: '/fake/global',
+        memoryPath: '/fake/global-memory',
+        storageBudgetBytes: 2 * 1024 * 1024,
+        alwaysInclude: true,
+      };
+      const multiConfig: LoadedConfig = {
+        configs: new Map([
+          ['test-lobe', initialConfig.configs.get('test-lobe')!],
+          ['global', globalConfig],
+        ]),
+        origin: { source: 'file', path: configPath },
+      };
+      const multiStores = new Map([
+        ['test-lobe', {} as MarkdownMemoryStore],
+        ['global', {} as MarkdownMemoryStore],
+      ]);
+      const multiHealth = new Map([
+        ['test-lobe', { status: 'healthy' as const }],
+        ['global', { status: 'healthy' as const }],
+      ]);
+
+      const manager = new ConfigManager(configPath, multiConfig, multiStores, multiHealth);
+      assert.deepEqual(manager.getAlwaysIncludeLobes(), ['global']);
+    });
+
+    it('excludes lobes with alwaysInclude: false', () => {
+      const falseConfig: MemoryConfig = {
+        repoRoot: '/fake/other',
+        memoryPath: '/fake/other-memory',
+        storageBudgetBytes: 2 * 1024 * 1024,
+        alwaysInclude: false,
+      };
+      const config: LoadedConfig = {
+        configs: new Map([
+          ['test-lobe', initialConfig.configs.get('test-lobe')!],
+          ['other', falseConfig],
+        ]),
+        origin: { source: 'file', path: configPath },
+      };
+      const stores = new Map([
+        ['test-lobe', {} as MarkdownMemoryStore],
+        ['other', {} as MarkdownMemoryStore],
+      ]);
+      const health = new Map([
+        ['test-lobe', { status: 'healthy' as const }],
+        ['other', { status: 'healthy' as const }],
+      ]);
+
+      const manager = new ConfigManager(configPath, config, stores, health);
+      assert.deepEqual(manager.getAlwaysIncludeLobes(), []);
     });
   });
 });

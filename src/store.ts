@@ -340,6 +340,13 @@ export class MarkdownMemoryStore {
     };
   }
 
+  /** Check if an entry exists by ID — read-only, no side effects beyond disk reload.
+   *  Use this to probe for entry ownership before calling correct(). */
+  async hasEntry(id: string): Promise<boolean> {
+    await this.reloadFromDisk();
+    return this.entries.has(id);
+  }
+
   /** Correct an existing entry */
   async correct(
     id: string,

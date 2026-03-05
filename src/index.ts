@@ -12,12 +12,10 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import path from 'path';
-import os from 'os';
-import { existsSync, writeFileSync } from 'fs';
 import { readFile, writeFile } from 'fs/promises';
 import { MarkdownMemoryStore } from './store.js';
 import type { DetailLevel, TopicScope, TrustLevel } from './types.js';
-import { DEFAULT_STORAGE_BUDGET_BYTES, parseTopicScope, parseTrustLevel, parseTags } from './types.js';
+import { parseTopicScope, parseTrustLevel } from './types.js';
 import { getLobeConfigs, type ConfigOrigin } from './config.js';
 import { ConfigManager } from './config-manager.js';
 import { normalizeArgs } from './normalize.js';
@@ -105,14 +103,9 @@ const lobeNames = Array.from(lobeConfigs.keys());
 // ConfigManager will be initialized after stores are set up
 let configManager: ConfigManager;
 
-// Global store for user identity + preferences (shared across all lobes)
-const GLOBAL_TOPICS = new Set<string>(['user', 'preferences']);
-const globalMemoryPath = path.join(os.homedir(), '.memory-mcp', 'global');
-const globalStore = new MarkdownMemoryStore({
-  repoRoot: os.homedir(),
-  memoryPath: globalMemoryPath,
-  storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES,
-});
+/** Topics that auto-route to the first alwaysInclude lobe when no lobe is specified on writes.
+ *  This is a backwards-compat shim — agents historically wrote these without specifying a lobe. */
+const ALWAYS_INCLUDE_WRITE_TOPICS: ReadonlySet<TopicScope> = new Set<TopicScope>(['user', 'preferences']);
 
 /** Resolved tool context — after resolution, the raw lobe string is inaccessible.
  *  This eliminates the entire class of bugs where handlers accidentally use
@@ -123,12 +116,7 @@ type ToolContext =
 
 /** Resolve a raw lobe name to a validated store + display label.
  *  After this call, consumers use ctx.label — the raw lobe is not in scope. */
-function resolveToolContext(rawLobe: string | undefined, opts?: { isGlobal?: boolean }): ToolContext {
-  // Global topics always route to the global store
-  if (opts?.isGlobal) {
-    return { ok: true, store: globalStore, label: 'global' };
-  }
-
+function resolveToolContext(rawLobe: string | undefined): ToolContext {
   const lobeNames = configManager.getLobeNames();
 
   // Default to single lobe when omitted
@@ -217,12 +205,14 @@ const server = new Server(
 
 /** Resolve which lobes to search for a read operation when the agent omitted the lobe param.
  *  Wires the MCP server's listRoots into the pure resolution logic. */
-async function resolveLobesForRead(): Promise<LobeResolution> {
+async function resolveLobesForRead(isFirstMemoryToolCall: boolean = true): Promise<LobeResolution> {
   const allLobeNames = configManager.getLobeNames();
+  const alwaysIncludeLobes = configManager.getAlwaysIncludeLobes();
 
-  // Short-circuit: single lobe is unambiguous
+  // Short-circuit: single lobe is unambiguous — no need for root matching.
+  // Handles both plain single-lobe and single-lobe-that-is-alwaysInclude cases.
   if (allLobeNames.length === 1) {
-    return buildLobeResolution(allLobeNames, allLobeNames);
+    return buildLobeResolution(allLobeNames, allLobeNames, alwaysIncludeLobes, isFirstMemoryToolCall);
   }
 
   // Multiple lobes — try MCP client roots
@@ -239,7 +229,7 @@ async function resolveLobesForRead(): Promise<LobeResolution> {
           .filter((c): c is LobeRootConfig => c !== undefined);
 
         const matched = matchRootsToLobeNames(roots, lobeConfigs);
-        return buildLobeResolution(allLobeNames, matched);
+        return buildLobeResolution(allLobeNames, matched, alwaysIncludeLobes, isFirstMemoryToolCall);
       }
     } catch (err) {
       process.stderr.write(`[memory-mcp] listRoots failed: ${err instanceof Error ? err.message : String(err)}\n`);
@@ -247,7 +237,7 @@ async function resolveLobesForRead(): Promise<LobeResolution> {
   }
 
   // Fallback — roots not available or no match
-  return buildLobeResolution(allLobeNames, []);
+  return buildLobeResolution(allLobeNames, [], alwaysIncludeLobes, isFirstMemoryToolCall);
 }
 
 /** Build the shared lobe property for tool schemas — called on each ListTools request
@@ -258,7 +248,7 @@ function buildLobeProperty(currentLobeNames: readonly string[]) {
     type: 'string' as const,
     description: isSingle
       ? `Memory lobe name (defaults to "${currentLobeNames[0]}" if omitted)`
-      : `Memory lobe name. When omitted for reads, the server uses the client's workspace roots to select the matching lobe. If roots are unavailable, only global knowledge (user/preferences) is returned — specify a lobe explicitly to access lobe-specific knowledge. Required for writes. Available: ${currentLobeNames.join(', ')}`,
+      : `Memory lobe name. When omitted for reads, the server uses the client's workspace roots to select the matching lobe. If roots are unavailable and no alwaysInclude lobes are configured, specify a lobe explicitly to access lobe-specific knowledge. Required for writes. Available: ${currentLobeNames.join(', ')}`,
     enum: currentLobeNames.length > 1 ? [...currentLobeNames] : undefined,
   };
 }
@@ -285,7 +275,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       // Example comes first — agents form their call shape from the first concrete pattern they see.
       // "entries" (not "content") signals a collection; fighting the "content = string" prior
       // is an architectural fix rather than patching the description after the fact.
-      description: 'memory_store(topic: "gotchas", entries: [{title: "Build cache", fact: "Must clean build after Tuist changes"}, {title: "Tuist version", fact: "Project requires Tuist 4.x"}], tags: ["build"]). Stores enduring knowledge — (1) Codebase facts (architecture, conventions, gotchas, modules): what IS true now, not past actions. Wrong: "Completed migration to StateFlow." Right: "All ViewModels use StateFlow." (2) User knowledge (user, preferences): who the person is, how they work. "user" and "preferences" are global. One insight per object; use multiple objects instead of bundling.',
+      description: 'memory_store(topic: "gotchas", entries: [{title: "Build cache", fact: "Must clean build after Tuist changes"}, {title: "Tuist version", fact: "Project requires Tuist 4.x"}], tags: ["build"]). Stores enduring knowledge — (1) Codebase facts (architecture, conventions, gotchas, modules): what IS true now, not past actions. Wrong: "Completed migration to StateFlow." Right: "All ViewModels use StateFlow." (2) User knowledge (user, preferences): who the person is, how they work. "user" and "preferences" are stored in the alwaysInclude lobe (shared across projects). One insight per object; use multiple objects instead of bundling.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -371,6 +361,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             type: 'string',
             description: 'Branch for recent-work. Omit = current branch, "*" = all branches.',
           },
+          isFirstMemoryToolCall: {
+            type: 'boolean',
+            description: 'Set true on first memory call in a conversation to include identity/preferences from alwaysInclude lobes. Set false on subsequent calls to skip redundant global knowledge.',
+            default: true,
+          },
         },
         required: [],
       },
@@ -420,6 +415,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             type: 'number',
             description: 'Min keyword match ratio 0-1 (default: 0.2). Higher = stricter.',
             default: 0.2,
+          },
+          isFirstMemoryToolCall: {
+            type: 'boolean',
+            description: 'Set true on first memory call in a conversation to include identity/preferences from alwaysInclude lobes. Set false on subsequent calls to skip redundant global knowledge.',
+            default: true,
           },
         },
         required: [],
@@ -492,16 +492,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'memory_list_lobes': {
         // Delegates to shared builder — same data as memory://lobes resource
         const lobeInfo = await buildLobeInfo();
-        const globalStats = await globalStore.stats();
+        const alwaysIncludeNames = configManager.getAlwaysIncludeLobes();
         const result = {
           serverMode: serverMode.kind,
-          globalStore: {
-            memoryPath: globalMemoryPath,
-            entries: globalStats.totalEntries,
-            storageUsed: globalStats.storageSize,
-            topics: 'user, preferences (shared across all lobes)',
-          },
           lobes: lobeInfo,
+          alwaysIncludeLobes: alwaysIncludeNames,
           configFile: configFileDisplay(),
           configSource: configOrigin.source,
           totalLobes: lobeInfo.length,
@@ -552,12 +547,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           effectiveLobe = inferLobeFromPaths(allPaths);
         }
 
+        // Auto-route user/preferences writes to the first alwaysInclude lobe when no lobe specified.
+        // This preserves the previous behavior where these topics auto-routed to the global store.
+        if (!effectiveLobe && ALWAYS_INCLUDE_WRITE_TOPICS.has(topic)) {
+          const alwaysIncludeLobes = configManager.getAlwaysIncludeLobes();
+          if (alwaysIncludeLobes.length > 0) {
+            effectiveLobe = alwaysIncludeLobes[0];
+          }
+        }
+
         // Resolve store — after this point, rawLobe is never used again
-        const isGlobal = GLOBAL_TOPICS.has(topic);
-        const ctx = resolveToolContext(effectiveLobe, { isGlobal });
+        const ctx = resolveToolContext(effectiveLobe);
         if (!ctx.ok) return contextError(ctx);
 
-        const effectiveTrust = isGlobal && trust === 'agent-inferred' ? 'user' : trust;
+        // Auto-promote trust for global topics: agents writing user/preferences without explicit
+        // trust: "user" still get full confidence. Preserves pre-unification behavior where the
+        // global store always stored these at user trust — removing this would silently downgrade
+        // identity entries to confidence 0.70 (see philosophy: "Observability as a constraint").
+        const effectiveTrust = ALWAYS_INCLUDE_WRITE_TOPICS.has(topic) && trust === 'agent-inferred'
+          ? 'user' as TrustLevel
+          : trust;
 
         // Store each entry and collect results — typed to the success branch only
         // (early return above handles the failure case, so only stored:true entries reach the array)
@@ -664,33 +673,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'memory_query': {
-        const { lobe: rawLobe, scope, detail, filter, branch } = z.object({
+        const { lobe: rawLobe, scope, detail, filter, branch, isFirstMemoryToolCall: rawIsFirst } = z.object({
           lobe: z.string().optional(),
           scope: z.string().default('*'),
           detail: z.enum(['brief', 'standard', 'full']).default('brief'),
           filter: z.string().optional(),
           branch: z.string().optional(),
+          isFirstMemoryToolCall: z.boolean().default(true),
         }).parse(args ?? {});
 
-        const isGlobalQuery = GLOBAL_TOPICS.has(scope);
+        // Force-include alwaysInclude lobes when querying a global topic (user/preferences),
+        // regardless of isFirstMemoryToolCall — the agent explicitly asked for this data.
+        // Philosophy: "Determinism over cleverness" — same query produces same results.
+        const topicScope = parseTopicScope(scope);
+        const effectiveIsFirst = rawIsFirst || (topicScope !== null && ALWAYS_INCLUDE_WRITE_TOPICS.has(topicScope));
 
-        // Resolve which lobes to search.
-        // Global topics always route to globalStore. Lobe topics follow the degradation ladder.
+        // Resolve which lobes to search — unified path for all topics.
         let lobeEntries: import('./types.js').QueryEntry[] = [];
         const entryLobeMap = new Map<string, string>(); // entry id → lobe name
         let label: string;
         let primaryStore: MarkdownMemoryStore | undefined;
         let queryGlobalOnlyHint: string | undefined;
 
-        if (isGlobalQuery) {
-          const ctx = resolveToolContext(rawLobe, { isGlobal: true });
-          if (!ctx.ok) return contextError(ctx);
-          label = ctx.label;
-          primaryStore = ctx.store;
-          const result = await ctx.store.query(scope, detail as DetailLevel, filter, branch);
-          for (const e of result.entries) entryLobeMap.set(e.id, 'global');
-          lobeEntries = [...result.entries];
-        } else if (rawLobe) {
+        if (rawLobe) {
           const ctx = resolveToolContext(rawLobe);
           if (!ctx.ok) return contextError(ctx);
           label = ctx.label;
@@ -698,7 +703,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const result = await ctx.store.query(scope, detail as DetailLevel, filter, branch);
           lobeEntries = [...result.entries];
         } else {
-          const resolution = await resolveLobesForRead();
+          const resolution = await resolveLobesForRead(effectiveIsFirst);
           switch (resolution.kind) {
             case 'resolved': {
               label = resolution.label;
@@ -722,17 +727,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        // For wildcard queries on non-global topics, also include global store entries
-        let globalEntries: typeof lobeEntries = [];
-        if (scope === '*' && !isGlobalQuery) {
-          const globalResult = await globalStore.query('*', detail as DetailLevel, filter);
-          for (const e of globalResult.entries) entryLobeMap.set(e.id, 'global');
-          globalEntries = [...globalResult.entries];
-        }
-
-        // Merge global + lobe entries, dedupe by id, sort by relevance score
+        // Dedupe by id, sort by relevance score
         const seenQueryIds = new Set<string>();
-        const allEntries = [...globalEntries, ...lobeEntries]
+        const allEntries = lobeEntries
           .filter(e => {
             if (seenQueryIds.has(e.id)) return false;
             seenQueryIds.add(e.id);
@@ -741,14 +738,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           .sort((a, b) => b.relevanceScore - a.relevanceScore);
 
         // Build stores collection for tag frequency aggregation
-        // Only include stores that were actually searched
         const searchedStores: MarkdownMemoryStore[] = [];
-        if (isGlobalQuery) {
-          searchedStores.push(globalStore);
-        } else {
-          if (primaryStore) searchedStores.push(primaryStore);
-          if (scope === '*') searchedStores.push(globalStore);
-        }
+        if (primaryStore) searchedStores.push(primaryStore);
         const tagFreq = mergeTagFrequencies(searchedStores);
 
         // Parse filter once for both filtering (already done) and footer display
@@ -845,27 +836,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        // Resolve store — route global entries (user-*, pref-*) to global store
-        const isGlobalEntry = id.startsWith('user-') || id.startsWith('pref-');
-        const ctx = resolveToolContext(rawLobe, { isGlobal: isGlobalEntry });
+        // Resolve store — if no lobe specified, probe alwaysInclude lobes first (read-only)
+        // to find where user/pref entries live, then apply the correction only to the owning store.
+        // Philosophy: "Prefer atomicity for correctness" — never call correct() speculatively.
+        let effectiveCorrectLobe = rawLobe;
+        if (!effectiveCorrectLobe) {
+          const alwaysIncludeLobes = configManager.getAlwaysIncludeLobes();
+          for (const lobeName of alwaysIncludeLobes) {
+            const store = configManager.getStore(lobeName);
+            if (!store) continue;
+            try {
+              if (await store.hasEntry(id)) {
+                effectiveCorrectLobe = lobeName;
+                break;
+              }
+            } catch (err) {
+              process.stderr.write(`[memory-mcp] Warning: hasEntry probe failed for lobe "${lobeName}": ${err instanceof Error ? err.message : String(err)}\n`);
+            }
+          }
+        }
+
+        // If we probed alwaysInclude lobes and didn't find the entry, provide a richer error
+        // than the generic "Lobe is required" from resolveToolContext.
+        if (!effectiveCorrectLobe && !rawLobe) {
+          const searchedLobes = configManager.getAlwaysIncludeLobes();
+          const allLobes = configManager.getLobeNames();
+          const searchedNote = searchedLobes.length > 0
+            ? `Searched alwaysInclude lobes (${searchedLobes.join(', ')}) — entry not found. `
+            : '';
+          return {
+            content: [{ type: 'text', text: `Entry "${id}" not found. ${searchedNote}Specify the lobe that contains it. Available: ${allLobes.join(', ')}` }],
+            isError: true,
+          };
+        }
+
+        const ctx = resolveToolContext(effectiveCorrectLobe);
         if (!ctx.ok) return contextError(ctx);
 
         const result = await ctx.store.correct(id, correction ?? '', action);
 
         if (!result.corrected) {
-          // If not found in the targeted store, try the other one as fallback
-          if (isGlobalEntry) {
-            const lobeCtx = resolveToolContext(rawLobe);
-            if (lobeCtx.ok) {
-              const lobeResult = await lobeCtx.store.correct(id, correction ?? '', action);
-              if (lobeResult.corrected) {
-                const text = action === 'delete'
-                  ? `[${lobeCtx.label}] Deleted entry ${id}.`
-                  : `[${lobeCtx.label}] Corrected entry ${id} (action: ${action}, confidence: ${lobeResult.newConfidence}, trust: ${lobeResult.trust}).`;
-                return { content: [{ type: 'text', text }] };
-              }
-            }
-          }
           return {
             content: [{ type: 'text', text: `[${ctx.label}] Failed to correct: ${result.error}` }],
             isError: true,
@@ -889,11 +899,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'memory_context': {
-        const { lobe: rawLobe, context, maxResults, minMatch } = z.object({
+        const { lobe: rawLobe, context, maxResults, minMatch, isFirstMemoryToolCall: rawIsFirst } = z.object({
           lobe: z.string().optional(),
           context: z.string().optional(),
           maxResults: z.number().optional(),
           minMatch: z.number().min(0).max(1).optional(),
+          isFirstMemoryToolCall: z.boolean().default(true),
         }).parse(args ?? {});
 
         // --- Briefing mode: no context provided → user + preferences + stale nudges ---
@@ -912,29 +923,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             ? `## ⚠ Degraded Lobes: ${degradedLobeNames.join(', ')}\nRun **memory_diagnose** for details.\n`
             : '';
 
-          // Global store holds user + preferences — always included
-          const globalBriefing = await globalStore.briefing(300);
-
           const sections: string[] = [];
           if (crashSection) sections.push(crashSection);
           if (degradedSection) sections.push(degradedSection);
 
-          if (globalBriefing.entryCount > 0) {
-            sections.push(globalBriefing.briefing);
-          }
-
-          // Collect stale entries and entry counts across all lobes
+          // Collect briefing, stale entries, and entry counts across all lobes
+          // (alwaysInclude lobes are in the lobe list — no separate global store query needed)
           const allStale: import('./types.js').StaleEntry[] = [];
-          if (globalBriefing.staleDetails) allStale.push(...globalBriefing.staleDetails);
-          let totalEntries = globalBriefing.entryCount;
-          let totalStale = globalBriefing.staleEntries;
+          let totalEntries = 0;
+          let totalStale = 0;
 
+          // Give alwaysInclude lobes a higher token budget (identity/preferences are high-value)
+          const alwaysIncludeSet = new Set(configManager.getAlwaysIncludeLobes());
           for (const lobeName of allBriefingLobeNames) {
             const health = configManager.getLobeHealth(lobeName);
             if (health?.status === 'degraded') continue;
             const store = configManager.getStore(lobeName);
             if (!store) continue;
-            const lobeBriefing = await store.briefing(100); // just enough for stale data + counts
+            const budget = alwaysIncludeSet.has(lobeName) ? 300 : 100;
+            const lobeBriefing = await store.briefing(budget);
+            if (alwaysIncludeSet.has(lobeName) && lobeBriefing.entryCount > 0) {
+              sections.push(lobeBriefing.briefing);
+            }
             if (lobeBriefing.staleDetails) allStale.push(...lobeBriefing.staleDetails);
             totalEntries += lobeBriefing.entryCount;
             totalStale += lobeBriefing.staleEntries;
@@ -949,7 +959,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
 
           // Tag primer: show tag vocabulary if tags exist across any lobe
-          const briefingStores: MarkdownMemoryStore[] = [globalStore];
+          const briefingStores: MarkdownMemoryStore[] = [];
           for (const lobeName of allBriefingLobeNames) {
             const store = configManager.getStore(lobeName);
             if (store) briefingStores.push(store);
@@ -992,7 +1002,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const lobeResults = await ctx.store.contextSearch(context, max, undefined, threshold);
           allLobeResults.push(...lobeResults);
         } else {
-          const resolution = await resolveLobesForRead();
+          const resolution = await resolveLobesForRead(rawIsFirst);
           switch (resolution.kind) {
             case 'resolved': {
               label = resolution.label;
@@ -1016,13 +1026,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        // Always include global store (user + preferences)
-        const globalResults = await globalStore.contextSearch(context, max, undefined, threshold);
-        for (const r of globalResults) ctxEntryLobeMap.set(r.entry.id, 'global');
-
-        // Merge, dedupe by entry id, re-sort by score, take top N
+        // Dedupe by entry id, re-sort by score, take top N
         const seenIds = new Set<string>();
-        const results = [...globalResults, ...allLobeResults]
+        const results = allLobeResults
           .sort((a, b) => b.score - a.score)
           .filter(r => {
             if (seenIds.has(r.entry.id)) return false;
@@ -1032,11 +1038,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           .slice(0, max);
 
         // Build stores collection for tag frequency aggregation
-        // Only include stores that were actually searched (not all lobes)
-        const ctxSearchedStores: MarkdownMemoryStore[] = [globalStore];
-        if (primaryStore && primaryStore !== globalStore) {
-          ctxSearchedStores.push(primaryStore);
-        }
+        const ctxSearchedStores: MarkdownMemoryStore[] = [];
+        if (primaryStore) ctxSearchedStores.push(primaryStore);
         const ctxTagFreq = mergeTagFrequencies(ctxSearchedStores);
 
         // Parse filter for footer (context search has no filter, pass empty)
@@ -1134,25 +1137,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           lobe: z.string().optional(),
         }).parse(args ?? {});
 
-        // Always include global stats
-        const globalStats = await globalStore.stats();
-
         // Single lobe stats
         if (rawLobe) {
           const ctx = resolveToolContext(rawLobe);
           if (!ctx.ok) return contextError(ctx);
           const result = await ctx.store.stats();
-          const sections = [formatStats('global (user + preferences)', globalStats), formatStats(ctx.label, result)];
-          return { content: [{ type: 'text', text: sections.join('\n\n---\n\n') }] };
+          const alwaysIncludeSet = new Set(configManager.getAlwaysIncludeLobes());
+          const label = alwaysIncludeSet.has(rawLobe) ? `${ctx.label} (alwaysInclude)` : ctx.label;
+          return { content: [{ type: 'text', text: formatStats(label, result) }] };
         }
 
         // Combined stats across all lobes
-        const sections: string[] = [formatStats('global (user + preferences)', globalStats)];
+        const sections: string[] = [];
         const allLobeNames = configManager.getLobeNames();
+        const alwaysIncludeSet = new Set(configManager.getAlwaysIncludeLobes());
         for (const lobeName of allLobeNames) {
-          const store = configManager.getStore(lobeName)!;
+          const store = configManager.getStore(lobeName);
+          if (!store) continue;
           const result = await store.stats();
-          sections.push(formatStats(lobeName, result));
+          const label = alwaysIncludeSet.has(lobeName) ? `${lobeName} (alwaysInclude)` : lobeName;
+          sections.push(formatStats(label, result));
         }
 
         return { content: [{ type: 'text', text: sections.join('\n\n---\n\n') }] };
@@ -1330,14 +1334,6 @@ async function buildDiagnosticsText(showFullCrashHistory: boolean): Promise<stri
   }
   sections.push('');
 
-  try {
-    const globalStats = await globalStore.stats();
-    sections.push(`- **global store**: ✅ healthy (${globalStats.totalEntries} entries, ${globalStats.storageSize})`);
-  } catch (e) {
-    sections.push(`- **global store**: ❌ error — ${e instanceof Error ? e.message : e}`);
-  }
-  sections.push('');
-
   // Active behavior config — shows effective values and highlights user overrides
   sections.push('### Active Behavior Config');
   sections.push(formatBehaviorConfigSection(configBehavior));
@@ -1392,15 +1388,6 @@ async function main() {
     const age = Math.round((Date.now() - new Date(previousCrash.timestamp).getTime()) / 1000);
     process.stderr.write(`[memory-mcp] Previous crash detected (${age}s ago): ${previousCrash.type} — ${previousCrash.error}\n`);
     process.stderr.write(`[memory-mcp] Crash report will be shown in memory_context and memory_diagnose.\n`);
-  }
-
-  // Initialize global store (user + preferences, shared across all lobes)
-  try {
-    await globalStore.init();
-    process.stderr.write(`[memory-mcp] Global store → ${globalMemoryPath}\n`);
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`[memory-mcp] WARNING: Global store init failed: ${msg}\n`);
   }
 
   // Initialize each lobe independently — a broken lobe shouldn't prevent others from working
@@ -1462,51 +1449,6 @@ async function main() {
     process.stderr.write(`[memory-mcp] ⚠ DEGRADED: ${healthyLobes}/${lobeConfigs.size} lobes healthy.\n`);
   }
 
-  // Migrate: move user + preferences entries from lobe stores to global store.
-  // State-driven guard: skip if already completed (marker file present).
-  const migrationMarker = path.join(globalMemoryPath, '.migrated');
-  if (!existsSync(migrationMarker)) {
-    let migrated = 0;
-    for (const [name, store] of stores) {
-      for (const topic of ['user', 'preferences'] as const) {
-        try {
-          const result = await store.query(topic, 'full');
-          for (const entry of result.entries) {
-            try {
-              const globalResult = await globalStore.query(topic, 'full');
-              const alreadyExists = globalResult.entries.some(g => g.title === entry.title);
-
-              if (!alreadyExists && entry.content) {
-                const trust = parseTrustLevel(entry.trust ?? 'user') ?? 'user';
-                await globalStore.store(
-                  topic,
-                  entry.title,
-                  entry.content,
-                  [...(entry.sources ?? [])],
-                  trust,
-                );
-                process.stderr.write(`[memory-mcp] Migrated ${entry.id} ("${entry.title}") from [${name}] → global\n`);
-                migrated++;
-              }
-
-              await store.correct(entry.id, '', 'delete');
-              process.stderr.write(`[memory-mcp] Removed ${entry.id} from [${name}] (now in global)\n`);
-            } catch (entryError) {
-              process.stderr.write(`[memory-mcp] Migration error for ${entry.id} in [${name}]: ${entryError}\n`);
-            }
-          }
-        } catch (topicError) {
-          process.stderr.write(`[memory-mcp] Migration error querying ${topic} in [${name}]: ${topicError}\n`);
-        }
-      }
-    }
-    // Write marker atomically — future startups skip this block entirely
-    try {
-      writeFileSync(migrationMarker, new Date().toISOString(), 'utf-8');
-      if (migrated > 0) process.stderr.write(`[memory-mcp] Migration complete: ${migrated} entries moved to global store.\n`);
-    } catch { /* marker write is best-effort */ }
-  }
-
   // Initialize ConfigManager with current config state
   configManager = new ConfigManager(configPath, { configs: lobeConfigs, origin: configOrigin }, stores, lobeHealth);
 
@@ -1539,7 +1481,12 @@ async function main() {
 
   await server.connect(transport);
   const modeStr = serverMode.kind === 'running' ? '' : ` [${serverMode.kind.toUpperCase()}]`;
-  process.stderr.write(`[memory-mcp] Server started${modeStr} with ${healthyLobes}/${lobeConfigs.size} lobe(s) + global store\n`);
+  const alwaysIncludeNames = configManager.getAlwaysIncludeLobes();
+  const aiLabel = alwaysIncludeNames.length > 0 ? ` (alwaysInclude: ${alwaysIncludeNames.join(', ')})` : '';
+  if (alwaysIncludeNames.length > 1) {
+    process.stderr.write(`[memory-mcp] Warning: ${alwaysIncludeNames.length} lobes have alwaysInclude: true (${alwaysIncludeNames.join(', ')}). Writes to user/preferences will route to the first one ("${alwaysIncludeNames[0]}"). This is likely a misconfiguration — typically only one lobe should be alwaysInclude.\n`);
+  }
+  process.stderr.write(`[memory-mcp] Server started${modeStr} with ${healthyLobes}/${lobeConfigs.size} lobe(s)${aiLabel}\n`);
 
   // Graceful shutdown on signals
   const shutdown = () => {

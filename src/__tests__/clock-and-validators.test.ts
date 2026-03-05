@@ -22,6 +22,7 @@ function makeConfig(repoRoot: string, clock?: Clock): MemoryConfig {
     repoRoot,
     memoryPath: path.join(repoRoot, '.memory'),
     storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES,
+    alwaysInclude: false,
     clock,
   };
 }

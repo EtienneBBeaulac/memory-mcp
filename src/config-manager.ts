@@ -31,6 +31,8 @@ export class ConfigManager {
   private stores: Map<string, MarkdownMemoryStore>;
   private lobeHealth: Map<string, LobeHealth>;
   private configMtime: number;
+  /** Cached alwaysInclude lobe names — recomputed atomically on reload. */
+  private cachedAlwaysIncludeLobes: readonly string[];
 
   // Dependency injection for testing: allow tests to override stat function
   protected async statFile(path: string): Promise<{ mtimeMs: number }> {
@@ -44,6 +46,14 @@ export class ConfigManager {
     this.stores = initialStores;
     this.lobeHealth = initialHealth;
     this.configMtime = Date.now(); // Initial mtime (will be updated on first stat)
+    this.cachedAlwaysIncludeLobes = ConfigManager.computeAlwaysIncludeLobes(this.lobeConfigs);
+  }
+
+  /** Derive alwaysInclude lobe names from config — pure, no side effects. */
+  private static computeAlwaysIncludeLobes(configs: ReadonlyMap<string, MemoryConfig>): readonly string[] {
+    return Array.from(configs.entries())
+      .filter(([, config]) => config.alwaysInclude === true)
+      .map(([name]) => name);
   }
 
   /**
@@ -111,12 +121,13 @@ export class ConfigManager {
         }
       }
 
-      // Atomic swap
+      // Atomic swap — all derived state recomputed together
       this.configOrigin = newConfig.origin;
       this.lobeConfigs = newConfig.configs;
       this.stores = newStores;
       this.lobeHealth = newHealth;
       this.configMtime = newMtime;
+      this.cachedAlwaysIncludeLobes = ConfigManager.computeAlwaysIncludeLobes(newConfig.configs);
 
       const lobeCount = newConfig.configs.size;
       const degradedCount = Array.from(newHealth.values()).filter(h => h.status === 'degraded').length;
@@ -149,5 +160,10 @@ export class ConfigManager {
 
   getLobeConfig(lobe: string): MemoryConfig | undefined {
     return this.lobeConfigs.get(lobe);
+  }
+
+  /** Returns lobe names where alwaysInclude is true. Cached; rebuilt atomically on hot-reload. */
+  getAlwaysIncludeLobes(): readonly string[] {
+    return this.cachedAlwaysIncludeLobes;
   }
 }

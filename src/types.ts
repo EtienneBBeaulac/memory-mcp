@@ -260,6 +260,7 @@ export interface MemoryConfig {
   readonly repoRoot: string;          // path to the target repository
   readonly memoryPath: string;        // absolute path to the memory storage directory
   readonly storageBudgetBytes: number; // default: 2MB
+  readonly alwaysInclude: boolean;    // when true, this lobe's entries are included in all read ops (unless agent opts out)
   readonly behavior?: BehaviorConfig; // user-facing behavior thresholds
   readonly clock?: Clock;             // injectable clock for testing; defaults to realClock
   readonly git?: GitService;          // injectable git service; defaults to realGitService
