@@ -3,7 +3,7 @@
 // Priority: memory-config.json → env vars → single-repo default
 // Graceful degradation: each source falls through to the next on failure.
 
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync, readdirSync } from 'fs';
 import { execFileSync } from 'child_process';
 import path from 'path';
 import os from 'os';
@@ -45,6 +45,7 @@ interface MemoryConfigFile {
     root: string;
     memoryDir?: string;
     budgetMB?: number;
+    alwaysInclude?: boolean;
   }>;
   /** Optional global behavior overrides applied to all lobes */
   behavior?: MemoryConfigFileBehavior;
@@ -135,6 +136,45 @@ function resolveMemoryPath(repoRoot: string, workspaceName: string, explicitMemo
   return path.join(os.homedir(), '.memory-mcp', workspaceName);
 }
 
+/** If no lobe has alwaysInclude: true AND the legacy global store directory has actual entries,
+ *  auto-create a "global" lobe pointing to it. Protects existing users who haven't updated their config.
+ *  Only fires when the dir contains .md files — an empty dir doesn't trigger creation. */
+function ensureAlwaysIncludeLobe(configs: Map<string, MemoryConfig>, behavior?: BehaviorConfig): void {
+  const hasAlwaysInclude = Array.from(configs.values()).some(c => c.alwaysInclude);
+  if (hasAlwaysInclude) return;
+
+  // Don't overwrite a user-defined "global" lobe — warn instead.
+  // Philosophy: "Make illegal states unrepresentable" — silently replacing config is a hidden state.
+  if (configs.has('global')) {
+    process.stderr.write(
+      `[memory-mcp] Lobe "global" exists but has no alwaysInclude flag. ` +
+      `Add "alwaysInclude": true to your global lobe config to include it in all reads.\n`
+    );
+    return;
+  }
+
+  const globalPath = path.join(os.homedir(), '.memory-mcp', 'global');
+  if (!existsSync(globalPath)) return;
+
+  // Only auto-create if the dir has actual memory entries (not just an empty directory)
+  try {
+    const files = readdirSync(globalPath);
+    if (!files.some(f => f.endsWith('.md'))) return;
+  } catch (err) {
+    process.stderr.write(`[memory-mcp] Warning: could not read legacy global store at ${globalPath}: ${err}\n`);
+    return;
+  }
+
+  configs.set('global', {
+    repoRoot: os.homedir(),
+    memoryPath: globalPath,
+    storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES,
+    alwaysInclude: true,
+    behavior,
+  });
+  process.stderr.write(`[memory-mcp] Auto-created "global" lobe (alwaysInclude) from existing ${globalPath}\n`);
+}
+
 /** Load lobe configs with priority: memory-config.json -> env vars -> single-repo default */
 export function getLobeConfigs(): LoadedConfig {
   const configs = new Map<string, MemoryConfig>();
@@ -166,14 +206,16 @@ export function getLobeConfigs(): LoadedConfig {
           repoRoot,
           memoryPath: resolveMemoryPath(repoRoot, name, config.memoryDir),
           storageBudgetBytes: (config.budgetMB ?? 2) * 1024 * 1024,
+          alwaysInclude: config.alwaysInclude ?? false,
           behavior,
         });
       }
 
       if (configs.size > 0) {
+        // Reuse the already-parsed behavior config for the alwaysInclude fallback
+        const resolvedBehavior = external.behavior ? behavior : undefined;
+        ensureAlwaysIncludeLobe(configs, resolvedBehavior);
         process.stderr.write(`[memory-mcp] Loaded ${configs.size} lobe(s) from memory-config.json\n`);
-        // Pass resolved behavior at the top-level so diagnostics can surface active values
-        const resolvedBehavior = external.behavior ? parseBehaviorConfig(external.behavior) : undefined;
         return { configs, origin: { source: 'file', path: configPath }, behavior: resolvedBehavior };
       }
     }
@@ -200,9 +242,11 @@ export function getLobeConfigs(): LoadedConfig {
           repoRoot,
           memoryPath: resolveMemoryPath(repoRoot, name, explicitDir),
           storageBudgetBytes: storageBudget,
+          alwaysInclude: false,
         });
       }
       if (configs.size > 0) {
+        ensureAlwaysIncludeLobe(configs);
         process.stderr.write(`[memory-mcp] Loaded ${configs.size} lobe(s) from MEMORY_MCP_WORKSPACES env var\n`);
         return { configs, origin: { source: 'env' } };
       }
@@ -220,7 +264,9 @@ export function getLobeConfigs(): LoadedConfig {
     repoRoot,
     memoryPath: resolveMemoryPath(repoRoot, 'default', explicitDir),
     storageBudgetBytes: storageBudget,
+    alwaysInclude: false,
   });
+  // No ensureAlwaysIncludeLobe here — single-repo default users have everything in one lobe
   process.stderr.write(`[memory-mcp] Using single-lobe default mode (cwd: ${repoRoot})\n`);
 
   return { configs, origin: { source: 'default' } };

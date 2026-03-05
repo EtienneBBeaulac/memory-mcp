@@ -70,22 +70,46 @@ export function matchRootsToLobeNames(
 }
 
 /** Build a LobeResolution from the available lobe names and matched lobes.
- *  Encodes the degradation ladder as a pure function. */
+ *  Encodes the degradation ladder as a pure function.
+ *
+ *  When isFirstMemoryToolCall is true (default), alwaysIncludeLobes are appended
+ *  to the resolved set (deduped). When false, they are excluded — the agent has
+ *  already loaded global knowledge in this conversation. */
 export function buildLobeResolution(
   allLobeNames: readonly string[],
   matchedLobes: readonly string[],
+  alwaysIncludeLobes: readonly string[] = [],
+  isFirstMemoryToolCall: boolean = true,
 ): LobeResolution {
   // Single lobe — always resolved, regardless of root matching
-  if (allLobeNames.length === 1) {
+  if (allLobeNames.length === 1 && alwaysIncludeLobes.length === 0) {
     return { kind: 'resolved', lobes: allLobeNames, label: allLobeNames[0] };
   }
 
-  // Multiple lobes with successful root match
-  if (matchedLobes.length > 0) {
+  // Build the base resolved set
+  let baseLobes: readonly string[];
+  if (allLobeNames.length === 1) {
+    baseLobes = allLobeNames;
+  } else if (matchedLobes.length > 0) {
+    baseLobes = matchedLobes;
+  } else {
+    baseLobes = [];
+  }
+
+  // Append alwaysInclude lobes when isFirstMemoryToolCall is true (deduped)
+  const resolvedSet = new Set(baseLobes);
+  if (isFirstMemoryToolCall) {
+    for (const lobe of alwaysIncludeLobes) {
+      resolvedSet.add(lobe);
+    }
+  }
+
+  if (resolvedSet.size > 0) {
+    const lobes = Array.from(resolvedSet);
     return {
       kind: 'resolved',
-      lobes: matchedLobes,
-      label: matchedLobes.length === 1 ? matchedLobes[0] : matchedLobes.join('+'),
+      lobes,
+      label: lobes.length === 1 ? lobes[0] : lobes.join('+'),
     };
   }
 

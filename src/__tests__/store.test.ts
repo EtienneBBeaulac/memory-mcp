@@ -21,7 +21,7 @@ async function cleanupTempDir(dir: string): Promise<void> {
 }
 
 function makeConfig(repoRoot: string): MemoryConfig {
-  return { repoRoot, memoryPath: path.join(repoRoot, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES };
+  return { repoRoot, memoryPath: path.join(repoRoot, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, alwaysInclude: false };
 }
 
 describe('MarkdownMemoryStore', () => {
@@ -214,6 +214,20 @@ describe('MarkdownMemoryStore', () => {
     it('sorts by confidence descending', async () => {
       const result = await store.query('*', 'brief');
       assert.ok(result.entries[0].confidence >= result.entries[1].confidence);
+    });
+  });
+
+  describe('hasEntry', () => {
+    it('returns true for an existing entry', async () => {
+      const result = await store.store('architecture', 'Test Entry', 'Content');
+      assert.equal(result.stored, true);
+      if (result.stored) {
+        assert.equal(await store.hasEntry(result.id), true);
+      }
+    });
+
+    it('returns false for a non-existent entry', async () => {
+      assert.equal(await store.hasEntry('nonexistent-1234'), false);
     });
   });
 
@@ -442,6 +456,7 @@ describe('MarkdownMemoryStore', () => {
         repoRoot: tempDir,
         memoryPath: path.join(tempDir, '.memory'),
         storageBudgetBytes: 100,
+        alwaysInclude: false,
       };
       const tinyStore = new MarkdownMemoryStore(tinyConfig);
       await tinyStore.init();
@@ -898,10 +913,10 @@ describe('MarkdownMemoryStore', () => {
       // Scenario A: default threshold (30 days) — 8-day-old entry should be fresh
       const dirA = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-beh-a-'));
       try {
-        const pastStoreA = new MarkdownMemoryStore({ repoRoot: dirA, memoryPath: path.join(dirA, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, clock: pastClock });
+        const pastStoreA = new MarkdownMemoryStore({ repoRoot: dirA, memoryPath: path.join(dirA, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, alwaysInclude: false, clock: pastClock });
         await pastStoreA.init();
         await pastStoreA.store('architecture', 'Recent Pattern', 'An architecture pattern written 8 days ago');
-        const defaultStore = new MarkdownMemoryStore({ repoRoot: dirA, memoryPath: path.join(dirA, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES });
+        const defaultStore = new MarkdownMemoryStore({ repoRoot: dirA, memoryPath: path.join(dirA, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, alwaysInclude: false });
         await defaultStore.init();
         const resultA = await defaultStore.query('architecture', 'brief');
         assert.ok(resultA.entries[0].fresh, 'Should be fresh under default 30-day threshold');
@@ -912,10 +927,10 @@ describe('MarkdownMemoryStore', () => {
       // Scenario B: staleDaysStandard: 5 — 8-day-old entry should be stale
       const dirB = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-beh-b-'));
       try {
-        const pastStoreB = new MarkdownMemoryStore({ repoRoot: dirB, memoryPath: path.join(dirB, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, clock: pastClock });
+        const pastStoreB = new MarkdownMemoryStore({ repoRoot: dirB, memoryPath: path.join(dirB, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, alwaysInclude: false, clock: pastClock });
         await pastStoreB.init();
         await pastStoreB.store('architecture', 'Recent Pattern', 'An architecture pattern written 8 days ago');
-        const strictStore = new MarkdownMemoryStore({ repoRoot: dirB, memoryPath: path.join(dirB, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, behavior: { staleDaysStandard: 5 } });
+        const strictStore = new MarkdownMemoryStore({ repoRoot: dirB, memoryPath: path.join(dirB, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, alwaysInclude: false, behavior: { staleDaysStandard: 5 } });
         await strictStore.init();
         const resultB = await strictStore.query('architecture', 'brief');
         assert.ok(!resultB.entries[0].fresh, 'Should be stale under custom 5-day threshold');
@@ -931,10 +946,10 @@ describe('MarkdownMemoryStore', () => {
       // Scenario A: default (90 days) — 40-day-old preference should be fresh
       const dirA = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-pref-a-'));
       try {
-        const pastA = new MarkdownMemoryStore({ repoRoot: dirA, memoryPath: path.join(dirA, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, clock: pastClock });
+        const pastA = new MarkdownMemoryStore({ repoRoot: dirA, memoryPath: path.join(dirA, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, alwaysInclude: false, clock: pastClock });
         await pastA.init();
         await pastA.store('preferences', 'Old Pref', 'Preference written 40 days ago');
-        const readA = new MarkdownMemoryStore({ repoRoot: dirA, memoryPath: path.join(dirA, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES });
+        const readA = new MarkdownMemoryStore({ repoRoot: dirA, memoryPath: path.join(dirA, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, alwaysInclude: false });
         await readA.init();
         const resultA = await readA.query('preferences', 'brief');
         assert.ok(resultA.entries[0].fresh, 'Should be fresh under default 90-day threshold');
@@ -945,10 +960,10 @@ describe('MarkdownMemoryStore', () => {
       // Scenario B: staleDaysPreferences: 30 — 40-day-old preference should be stale
       const dirB = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-pref-b-'));
       try {
-        const pastB = new MarkdownMemoryStore({ repoRoot: dirB, memoryPath: path.join(dirB, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, clock: pastClock });
+        const pastB = new MarkdownMemoryStore({ repoRoot: dirB, memoryPath: path.join(dirB, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, alwaysInclude: false, clock: pastClock });
         await pastB.init();
         await pastB.store('preferences', 'Old Pref', 'Preference written 40 days ago');
-        const strictB = new MarkdownMemoryStore({ repoRoot: dirB, memoryPath: path.join(dirB, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, behavior: { staleDaysPreferences: 30 } });
+        const strictB = new MarkdownMemoryStore({ repoRoot: dirB, memoryPath: path.join(dirB, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, alwaysInclude: false, behavior: { staleDaysPreferences: 30 } });
         await strictB.init();
         const resultB = await strictB.query('preferences', 'brief');
         assert.ok(!resultB.entries[0].fresh, 'Should be stale under custom 30-day preferences threshold');
@@ -1141,11 +1156,11 @@ describe('MarkdownMemoryStore', () => {
       // New temp dir for the 95-day test — write with 95-days-ago clock, read with current clock
       const dir95 = await fs.mkdtemp(path.join(os.tmpdir(), 'mem-stale-'));
       try {
-        const store95 = new MarkdownMemoryStore({ repoRoot: dir95, memoryPath: path.join(dir95, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, clock: clock95 });
+        const store95 = new MarkdownMemoryStore({ repoRoot: dir95, memoryPath: path.join(dir95, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, alwaysInclude: false, clock: clock95 });
         await store95.init();
         await store95.store('preferences', 'Pref 95', 'Use MVI everywhere');
         // Re-read with current clock to check freshness at current time
-        const currentStore95 = new MarkdownMemoryStore({ repoRoot: dir95, memoryPath: path.join(dir95, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES });
+        const currentStore95 = new MarkdownMemoryStore({ repoRoot: dir95, memoryPath: path.join(dir95, '.memory'), storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES, alwaysInclude: false });
         await currentStore95.init();
         const result95 = await currentStore95.query('preferences', 'brief');
         assert.ok(!result95.entries[0].fresh, '95-day-old preference should be stale (exceeds 90-day window)');

@@ -215,4 +215,79 @@ describe('buildLobeResolution', () => {
       }
     });
   });
+
+  describe('alwaysInclude lobes', () => {
+    it('appends alwaysInclude lobes when isFirstMemoryToolCall is true', () => {
+      const result = buildLobeResolution(['my-project', 'global'], ['my-project'], ['global'], true);
+      assert.strictEqual(result.kind, 'resolved');
+      if (result.kind === 'resolved') {
+        assert.deepStrictEqual(new Set(result.lobes), new Set(['my-project', 'global']));
+      }
+    });
+
+    it('excludes alwaysInclude lobes when isFirstMemoryToolCall is false', () => {
+      const result = buildLobeResolution(['my-project', 'global'], ['my-project'], ['global'], false);
+      assert.strictEqual(result.kind, 'resolved');
+      if (result.kind === 'resolved') {
+        assert.deepStrictEqual(result.lobes, ['my-project']);
+      }
+    });
+
+    it('deduplicates when alwaysInclude lobe overlaps with matched lobe', () => {
+      const result = buildLobeResolution(['global'], ['global'], ['global'], true);
+      assert.strictEqual(result.kind, 'resolved');
+      if (result.kind === 'resolved') {
+        assert.deepStrictEqual(result.lobes, ['global']);
+      }
+    });
+
+    it('has no effect when alwaysIncludeLobes is empty', () => {
+      const result = buildLobeResolution(['my-project'], ['my-project'], [], true);
+      assert.strictEqual(result.kind, 'resolved');
+      if (result.kind === 'resolved') {
+        assert.deepStrictEqual(result.lobes, ['my-project']);
+        assert.strictEqual(result.label, 'my-project');
+      }
+    });
+
+    it('defaults to isFirstMemoryToolCall=true when params omitted', () => {
+      // Existing 2-arg call: should behave same as (allLobes, matched, [], true)
+      const result = buildLobeResolution(['my-project'], []);
+      assert.strictEqual(result.kind, 'resolved');
+      if (result.kind === 'resolved') {
+        assert.deepStrictEqual(result.lobes, ['my-project']);
+      }
+    });
+
+    it('resolves alwaysInclude lobes even when no lobes matched (multi-lobe fallback)', () => {
+      const result = buildLobeResolution(['zillow', 'eidola', 'global'], [], ['global'], true);
+      assert.strictEqual(result.kind, 'resolved');
+      if (result.kind === 'resolved') {
+        assert.deepStrictEqual(result.lobes, ['global']);
+      }
+    });
+
+    it('returns global-only when no matches, no alwaysInclude, and isFirstMemoryToolCall is false', () => {
+      const result = buildLobeResolution(['zillow', 'eidola'], [], ['global'], false);
+      assert.strictEqual(result.kind, 'global-only');
+    });
+
+    it('single lobe with alwaysInclude resolves without short-circuit', () => {
+      // When the single lobe IS the alwaysInclude lobe, it should still resolve
+      const result = buildLobeResolution(['global'], [], ['global'], true);
+      assert.strictEqual(result.kind, 'resolved');
+      if (result.kind === 'resolved') {
+        assert.deepStrictEqual(result.lobes, ['global']);
+        assert.strictEqual(result.label, 'global');
+      }
+    });
+
+    it('multiple alwaysInclude lobes all included on first call', () => {
+      const result = buildLobeResolution(['proj', 'global', 'team'], ['proj'], ['global', 'team'], true);
+      assert.strictEqual(result.kind, 'resolved');
+      if (result.kind === 'resolved') {
+        assert.deepStrictEqual(new Set(result.lobes), new Set(['proj', 'global', 'team']));
+      }
+    });
+  });
 });
