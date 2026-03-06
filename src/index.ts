@@ -24,7 +24,7 @@ import {
   readCrashHistory, clearLatestCrash, formatCrashReport, formatCrashSummary,
   markServerStarted, type CrashContext, type CrashReport,
 } from './crash-journal.js';
-import { formatStaleSection, formatConflictWarning, formatStats, formatBehaviorConfigSection, mergeTagFrequencies, buildQueryFooter, buildTagPrimerSection } from './formatters.js';
+import { formatStaleSection, formatConflictWarning, formatStats, formatBehaviorConfigSection, mergeTagFrequencies, buildQueryFooter, buildBriefingTagPrimerSections } from './formatters.js';
 import { parseFilter, type FilterGroup } from './text-analyzer.js';
 import { VOCABULARY_ECHO_LIMIT, MAX_FOOTER_TAGS, WARN_SEPARATOR } from './thresholds.js';
 import { matchRootsToLobeNames, buildLobeResolution, type LobeResolution, type LobeRootConfig } from './lobe-resolution.js';
@@ -983,16 +983,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             sections.push('No knowledge stored yet. As you work, store observations with memory_store. Try memory_bootstrap to seed initial knowledge from the repo.');
           }
 
-          // Tag primer: show tag vocabulary if tags exist across any lobe
-          const briefingStores: MarkdownMemoryStore[] = [];
-          for (const lobeName of allBriefingLobeNames) {
-            const store = configManager.getStore(lobeName);
-            if (store) briefingStores.push(store);
-          }
-          const briefingTagFreq = mergeTagFrequencies(briefingStores);
-          const tagPrimer = buildTagPrimerSection(briefingTagFreq);
-          if (tagPrimer) {
-            sections.push(tagPrimer);
+          // Tag primer: keep vocabularies lobe-local instead of merging them across lobes.
+          const briefingTagPrimers = buildBriefingTagPrimerSections(
+            allBriefingLobeNames
+              .filter(lobeName => configManager.getLobeHealth(lobeName)?.status !== 'degraded')
+              .map((lobeName): readonly [string, ReadonlyMap<string, number>] => {
+                const store = configManager.getStore(lobeName);
+                return [lobeName, store?.getTagFrequency() ?? new Map<string, number>()] as const;
+              })
+          );
+          if (briefingTagPrimers.length > 0) {
+            sections.push(...briefingTagPrimers);
           }
 
           const briefingHints: string[] = [];
