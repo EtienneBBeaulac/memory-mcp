@@ -207,7 +207,10 @@ export function buildQueryFooter(opts: {
 }
 
 /** Build tag primer section for session briefing — pure function */
-export function buildTagPrimerSection(tagFreq: ReadonlyMap<string, number>): string {
+export function buildTagPrimerSection(
+  tagFreq: ReadonlyMap<string, number>,
+  lobeName?: string,
+): string {
   if (tagFreq.size === 0) return '';
   
   const allTags = [...tagFreq.entries()]
@@ -216,11 +219,25 @@ export function buildTagPrimerSection(tagFreq: ReadonlyMap<string, number>): str
     .join(', ');
   
   return [
-    `### Tag Vocabulary (${tagFreq.size} tags)`,
+    lobeName
+      ? `### Tag Vocabulary — ${lobeName} (${tagFreq.size} tags)`
+      : `### Tag Vocabulary (${tagFreq.size} tags)`,
     allTags,
     ``,
     `Filter by tags: memory_query(filter: "#auth") — exact match`,
     `Combine: memory_query(filter: "#auth middleware") — tag + keyword`,
     `Multiple: memory_query(filter: "#auth|#security") — OR logic`,
   ].join('\n');
+}
+ 
+/** Build briefing tag primer sections without merging vocabularies across lobes. */
+export function buildBriefingTagPrimerSections(
+  lobeTagFrequencies: Iterable<readonly [string, ReadonlyMap<string, number>]>,
+): readonly string[] {
+  const nonEmpty = Array.from(lobeTagFrequencies)
+    .filter(([, tagFreq]) => tagFreq.size > 0);
+  const includeLobeNames = nonEmpty.length > 1;
+  return nonEmpty.map(([lobeName, tagFreq]) =>
+    buildTagPrimerSection(tagFreq, includeLobeNames ? lobeName : undefined)
+  );
 }
