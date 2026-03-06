@@ -828,34 +828,43 @@ describe('E2E: MCP Server', () => {
   // ────────────────────────────────────────────────────────────────────────
 
   describe('ephemeral content detection (e2e)', () => {
-    it('surfaces ephemeral warning for temporal content via tool call', async () => {
+    it('returns review-required for temporal content via tool call', async () => {
       const resp = await client.callTool('memory_store', {
         topic: 'gotchas',
         entries: [{ title: 'Ephemeral Test Entry', fact: 'The build is currently broken and we are investigating the root cause right now' }],
         trust: 'agent-inferred',
       });
-      assert.ok(!client.isError(resp), `Store should succeed: ${client.getText(resp)}`);
+      assert.ok(client.isError(resp), 'Temporal ephemeral content should require review before storing');
       const text = client.getText(resp);
-      assert.ok(text.includes('Stored entry'), 'Entry should be stored (soft warning, not blocked)');
-      assert.ok(text.includes('EPHEMERAL'), 'Should include ephemeral warning block');
-      assert.ok(text.includes('6 months'), 'Should include the 6-months test');
-
-      // Clean up
-      const idMatch = text.match(/(gotcha-[0-9a-f]+)/);
-      if (idMatch) await client.callTool('memory_correct', { id: idMatch[1], action: 'delete' });
+      assert.ok(text.includes('Review required'), 'Should surface the review-required path');
+      assert.ok(text.includes('Likely ephemeral'), 'Should explain why persistence was blocked');
     });
 
-    it('surfaces ephemeral warning for fixed-bug content', async () => {
+    it('returns review-required for fixed-bug content', async () => {
       const resp = await client.callTool('memory_store', {
         topic: 'gotchas',
         entries: [{ title: 'Fixed Bug Entry', fact: 'The crash bug in messaging has been resolved by updating the dependency injection scope' }],
         trust: 'agent-confirmed',
       });
-      assert.ok(!client.isError(resp));
+      assert.ok(client.isError(resp));
       const text = client.getText(resp);
-      assert.ok(text.includes('EPHEMERAL') || text.includes('6 months'), 'Should include ephemeral warning for fixed bugs');
-      assert.ok(text.includes('memory_correct'), 'Should include delete command in warning');
-
+      assert.ok(text.includes('Review required'), 'Should surface the review-required path');
+      assert.ok(text.includes('Likely ephemeral'), 'Should explain why persistence was blocked');
+      assert.ok(text.includes('durabilityDecision: "store-anyway"'), 'Should include the explicit re-run instruction');
+    });
+ 
+    it('stores fixed-bug content when durabilityDecision is store-anyway', async () => {
+      const resp = await client.callTool('memory_store', {
+        topic: 'gotchas',
+        entries: [{ title: 'Fixed Bug Entry', fact: 'The crash bug in messaging has been resolved by updating the dependency injection scope' }],
+        trust: 'agent-confirmed',
+        durabilityDecision: 'store-anyway',
+      });
+      assert.ok(!client.isError(resp), `Explicit override should store successfully: ${client.getText(resp)}`);
+      const text = client.getText(resp);
+      assert.ok(text.includes('Stored entry'), 'Should store when explicitly overridden');
+      assert.ok(text.includes('EPHEMERAL') || text.includes('6 months'), 'Stored override should still surface the warning');
+ 
       const idMatch = text.match(/(gotcha-[0-9a-f]+)/);
       if (idMatch) await client.callTool('memory_correct', { id: idMatch[1], action: 'delete' });
     });

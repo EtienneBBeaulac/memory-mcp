@@ -1336,29 +1336,49 @@ describe('MarkdownMemoryStore', () => {
   // Ephemeral content detection at store time
   // ────────────────────────────────────────────────────────────────────────
 
-  describe('ephemeral warnings', () => {
-    it('returns ephemeralWarning for content with temporal language', async () => {
+  describe('ephemeral review-required flow', () => {
+    it('returns review-required and does not persist content with temporal language by default', async () => {
       const result = await store.store(
         'gotchas',
         'Build Issue',
         'The build is currently broken due to a Gradle sync issue that appeared today',
       );
-      assert.ok(result.stored, 'Should still store the entry');
-      if (!result.stored) return;
-      assert.ok(result.ephemeralWarning, 'Should include ephemeral warning');
-      assert.ok(result.ephemeralWarning!.includes('Temporal language'));
+      assert.equal(result.kind, 'review-required');
+      assert.equal(result.stored, false);
+      if (result.kind !== 'review-required') return;
+      assert.equal(result.severity, 'medium');
+      assert.ok(result.signals.some(signal => signal.label.includes('Temporal language')));
+      const query = await store.query('gotchas', 'brief');
+      assert.equal(query.entries.length, 0, 'review-required content should not persist by default');
     });
 
-    it('returns ephemeralWarning for fixed-bug content', async () => {
+    it('returns review-required for fixed-bug content by default', async () => {
       const result = await store.store(
         'gotchas',
         'Resolved Crash',
         'The crash bug in the messaging reducer has been fixed after we updated the coroutine scope handling',
       );
-      assert.ok(result.stored);
-      if (!result.stored) return;
-      assert.ok(result.ephemeralWarning, 'Should warn about resolved issues');
-      assert.ok(result.ephemeralWarning!.includes('Resolved issue'));
+      assert.equal(result.kind, 'review-required');
+      assert.equal(result.stored, false);
+      if (result.kind !== 'review-required') return;
+      assert.ok(result.signals.some(signal => signal.label.includes('Resolved issue')));
+    });
+ 
+    it('stores ephemeral content when durabilityDecision is store-anyway', async () => {
+      const result = await store.store(
+        'gotchas',
+        'Resolved Crash',
+        'The crash bug in the messaging reducer has been fixed after we updated the coroutine scope handling',
+        [],
+        'agent-inferred',
+        [],
+        [],
+        'store-anyway',
+      );
+      assert.equal(result.kind, 'stored');
+      assert.equal(result.stored, true);
+      if (result.kind !== 'stored') return;
+      assert.ok(result.ephemeralWarning, 'Stored override should still surface the warning');
     });
 
     it('does not return ephemeralWarning for durable content', async () => {

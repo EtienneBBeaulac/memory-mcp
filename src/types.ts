@@ -155,10 +155,25 @@ export interface RelatedEntry {
   readonly confidence: number;
   readonly trust: TrustLevel;
 }
+ 
+/** Caller intent for writes that may require a durability decision.
+ *  Explicit domain type avoids booleanly-typed override semantics. */
+export type DurabilityDecision = 'default' | 'store-anyway';
+ 
+/** Structured signal attached to a review-required store outcome.
+ *  Duplicated here (rather than importing from ephemeral.ts) to keep the store
+ *  result contract independent of a concrete detection implementation. */
+export interface ReviewSignal {
+  readonly id: string;
+  readonly label: string;
+  readonly detail: string;
+  readonly confidence: 'high' | 'medium' | 'low';
+}
 
 /** Result of a memory store operation — discriminated union eliminates impossible states */
 export type StoreResult =
   | {
+      readonly kind: 'stored';
       readonly stored: true;
       readonly id: string;
       readonly topic: TopicScope;
@@ -173,6 +188,15 @@ export type StoreResult =
       readonly relevantPreferences?: readonly RelatedEntry[];
     }
   | {
+      readonly kind: 'review-required';
+      readonly stored: false;
+      readonly topic: TopicScope;
+      readonly severity: EphemeralSeverity;
+      readonly warning: string;
+      readonly signals: readonly ReviewSignal[];
+    }
+  | {
+      readonly kind: 'rejected';
       readonly stored: false;
       readonly topic: TopicScope;
       readonly warning: string;

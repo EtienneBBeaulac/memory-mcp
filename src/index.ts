@@ -275,7 +275,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       // Example comes first — agents form their call shape from the first concrete pattern they see.
       // "entries" (not "content") signals a collection; fighting the "content = string" prior
       // is an architectural fix rather than patching the description after the fact.
-      description: 'memory_store(topic: "gotchas", entries: [{title: "Build cache", fact: "Must clean build after Tuist changes"}, {title: "Tuist version", fact: "Project requires Tuist 4.x"}], tags: ["build"]). Stores enduring knowledge — (1) Codebase facts (architecture, conventions, gotchas, modules): what IS true now, not past actions. Wrong: "Completed migration to StateFlow." Right: "All ViewModels use StateFlow." (2) User knowledge (user, preferences): who the person is, how they work. "user" and "preferences" are stored in the alwaysInclude lobe (shared across projects). One insight per object; use multiple objects instead of bundling.',
+      description: 'memory_store(topic: "gotchas", entries: [{title: "Build cache", fact: "Must clean build after Tuist changes"}, {title: "Tuist version", fact: "Project requires Tuist 4.x"}], tags: ["build"]). Stores enduring knowledge — (1) Codebase facts (architecture, conventions, gotchas, modules): what IS true now, not past actions. Wrong: "Completed migration to StateFlow." Right: "All ViewModels use StateFlow." (2) User knowledge (user, preferences): who the person is, how they work. "user" and "preferences" are stored in the alwaysInclude lobe (shared across projects). One insight per object; use multiple objects instead of bundling. If content looks likely-ephemeral, the tool returns a review-required response; re-run with durabilityDecision: "store-anyway" only when deliberate.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -331,6 +331,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             items: { type: 'string' },
             description: 'Category labels for exact-match retrieval (lowercase slugs). Query with filter: "#tag". Example: ["auth", "critical-path", "mite-combat"]',
             default: [],
+          },
+          durabilityDecision: {
+            type: 'string',
+            enum: ['default', 'store-anyway'],
+            description: 'Write intent for content that may require review. Use "default" normally. Use "store-anyway" only when intentionally persisting content after a review-required response.',
+            default: 'default',
           },
         },
         required: ['topic', 'entries'],
@@ -509,7 +515,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'memory_store': {
-        const { lobe: rawLobe, topic: rawTopic, entries: rawEntries, sources, references, trust: rawTrust, tags: rawTags } = z.object({
+        const { lobe: rawLobe, topic: rawTopic, entries: rawEntries, sources, references, trust: rawTrust, tags: rawTags, durabilityDecision } = z.object({
           lobe: z.string().optional(),
           topic: z.string(),
           // Accept a bare {title, fact} object in addition to the canonical array form.
@@ -526,6 +532,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           references: z.array(z.string()).default([]),
           trust: z.enum(['user', 'agent-confirmed', 'agent-inferred']).default('agent-inferred'),
           tags: z.array(z.string()).default([]),
+          durabilityDecision: z.enum(['default', 'store-anyway']).default('default'),
         }).parse(args);
 
         // Validate topic at boundary
@@ -570,11 +577,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Store each entry and collect results — typed to the success branch only
         // (early return above handles the failure case, so only stored:true entries reach the array)
-        type StoreSuccess = Extract<Awaited<ReturnType<typeof ctx.store.store>>, { stored: true }>;
+        type StoreSuccess = Extract<Awaited<ReturnType<typeof ctx.store.store>>, { kind: 'stored' }>;
         const storedResults: Array<{ title: string; result: StoreSuccess }> = [];
         for (const { title, fact } of rawEntries) {
-          const result = await ctx.store.store(topic, title, fact, sources, effectiveTrust, references, rawTags);
-          if (!result.stored) {
+          const result = await ctx.store.store(topic, title, fact, sources, effectiveTrust, references, rawTags, durabilityDecision);
+          if (result.kind === 'review-required') {
+            const lines = [
+              `[${ctx.label}] Review required before storing "${title}".`,
+              '',
+              `Severity: ${result.severity}`,
+              'Signals:',
+              ...result.signals.map(signal => `- ${signal.label}: ${signal.detail}`),
+              '',
+              result.warning,
+              '',
+              'If this knowledge is still worth persisting, re-run with:',
+              `memory_store(topic: "${topic}", entries: [{title: "${title}", fact: "${fact.replace(/"/g, '\\"')}"}], trust: "${effectiveTrust}", durabilityDecision: "store-anyway"${rawTags.length > 0 ? `, tags: ${JSON.stringify(rawTags)}` : ''}${sources.length > 0 ? `, sources: ${JSON.stringify(sources)}` : ''}${references.length > 0 ? `, references: ${JSON.stringify(references)}` : ''})`,
+            ];
+            return {
+              content: [{ type: 'text', text: lines.join('\n') }],
+              isError: true,
+            };
+          }
+          if (result.kind === 'rejected') {
             return {
               content: [{ type: 'text', text: `[${ctx.label}] Failed to store "${title}": ${result.warning}` }],
               isError: true,
@@ -1209,8 +1234,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!ctx.ok) return contextError(ctx);
 
         const results = await ctx.store.bootstrap();
-        const stored = results.filter(r => r.stored);
-        const failed = results.filter(r => !r.stored);
+        const stored = results.filter((r): r is Extract<typeof r, { kind: 'stored' }> => r.kind === 'stored');
+        const failed = results.filter((r): r is Extract<typeof r, { kind: 'rejected' | 'review-required' }> => r.kind !== 'stored');
 
         let text = `## [${ctx.label}] Bootstrap Complete\n\nStored ${stored.length} entries:`;
         for (const r of stored) {
