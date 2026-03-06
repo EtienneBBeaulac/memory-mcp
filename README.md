@@ -8,7 +8,7 @@ A Model Context Protocol (MCP) server that gives AI coding agents persistent, ev
 |------|-------------|
 | `memory_context` | Session start AND pre-task lookup. Call with no args for user + preferences + stale nudges; call with `context` for task-specific knowledge |
 | `memory_query` | Structured search with brief/standard/full detail levels and AND/OR/NOT filter syntax. Scope defaults to `"*"` (all topics) |
-| `memory_store` | Store a knowledge entry with dedup detection, preference surfacing, and lobe auto-detection from file paths |
+| `memory_store` | Store a knowledge entry with dedup detection, preference surfacing, lobe auto-detection, and a review-required gate for likely-ephemeral content |
 | `memory_correct` | Correct, update, or delete an existing entry (suggests storing as preference) |
 | `memory_bootstrap` | First-use scan to seed knowledge from repo structure, README, and build files |
 
@@ -33,6 +33,7 @@ A Model Context Protocol (MCP) server that gives AI coding agents persistent, ev
 
 - **Dedup detection**: When you store an entry, the response shows similar existing entries in the same topic (>35% keyword overlap) with consolidation instructions
 - **Preference surfacing**: Storing a non-preference entry shows relevant preferences that might conflict
+- **Ephemeral review gate**: Likely-ephemeral content is blocked before persistence by default. Re-run `memory_store(..., durabilityDecision: "store-anyway")` only when you intentionally want to keep it.
 - **Piggyback hints**: `memory_correct` suggests storing corrections as reusable preferences
 - **`memory_context`**: Describe your task in natural language and get ranked results across all topics with topic-based boosting (preferences 1.8x, gotchas 1.5x)
 
@@ -108,9 +109,11 @@ If no `memory-config.json` is found, the server falls back to environment variab
 1. **Edit `memory-config.json`** (create if it doesn't exist)
 2. **Add lobe entry:**
    ```json
+   {
    "my-project": {
      "root": "$HOME/git/my-project",
      "budgetMB": 2
+   }
    }
    ```
 3. **Restart the memory MCP server**

@@ -8,7 +8,7 @@ import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import type {
-  MemoryEntry, TopicScope, TrustLevel, DetailLevel, Tag,
+  MemoryEntry, TopicScope, TrustLevel, DetailLevel, Tag, DurabilityDecision,
   QueryResult, QueryEntry, StoreResult, CorrectResult, MemoryStats,
   BriefingResult, StaleEntry, ConflictPair, MemoryConfig, RelatedEntry, Clock, GitService,
 } from './types.js';
@@ -85,13 +85,36 @@ export class MarkdownMemoryStore {
     trust: TrustLevel = 'agent-inferred',
     references: string[] = [],
     rawTags: string[] = [],
+    durabilityDecision: DurabilityDecision = 'default',
   ): Promise<StoreResult> {
     // Check storage budget — null means we can't measure, allow the write
     const currentSize = await this.getStorageSize();
     if (currentSize !== null && currentSize >= this.config.storageBudgetBytes) {
       return {
-        stored: false, topic,
+        kind: 'rejected', stored: false, topic,
         warning: `Storage budget exceeded (${this.formatBytes(currentSize)} / ${this.formatBytes(this.config.storageBudgetBytes)}). Delete or correct existing entries to free space.`,
+      };
+    }
+ 
+    const ephemeralSignals = topic !== 'recent-work'
+      ? detectEphemeralSignals(title, content, topic)
+      : [];
+    const ephemeralSeverity = getEphemeralSeverity(ephemeralSignals);
+ 
+    const requiresReview = ephemeralSeverity === 'medium' || ephemeralSeverity === 'high';
+    if (durabilityDecision === 'default' && requiresReview) {
+      return {
+        kind: 'review-required',
+        stored: false,
+        topic,
+        severity: ephemeralSeverity,
+        warning: `Likely ephemeral content detected. Review the signals and re-run with durabilityDecision: "store-anyway" if this knowledge should still be persisted.`,
+        signals: ephemeralSignals.map(signal => ({
+          id: signal.id,
+          label: signal.label,
+          detail: signal.detail,
+          confidence: signal.confidence,
+        })),
       };
     }
 
@@ -139,16 +162,10 @@ export class MarkdownMemoryStore {
       ? this.findRelevantPreferences(entry)
       : undefined;
 
-    // Soft ephemeral detection — warn but never block
-    const ephemeralSignals = topic !== 'recent-work'
-      ? detectEphemeralSignals(title, content, topic)
-      : [];
-    // getEphemeralSeverity is the single source of threshold logic shared with formatEphemeralWarning.
-    const ephemeralSeverity = getEphemeralSeverity(ephemeralSignals);
     const ephemeralWarning = formatEphemeralWarning(ephemeralSignals, id);
 
     return {
-      stored: true, id, topic, file, confidence, warning, ephemeralWarning,
+      kind: 'stored', stored: true, id, topic, file, confidence, warning, ephemeralWarning,
       ephemeralSeverity: ephemeralSeverity ?? undefined,
       relatedEntries: relatedEntries.length > 0 ? relatedEntries : undefined,
       relevantPreferences: relevantPreferences && relevantPreferences.length > 0 ? relevantPreferences : undefined,
@@ -505,7 +522,7 @@ export class MarkdownMemoryStore {
 
     // 5. Fallback: if nothing was detected, store a minimal overview so the lobe
     //    is never left completely empty after bootstrap (makes memory_context useful immediately).
-    const storedCount = results.filter(r => r.stored).length;
+    const storedCount = results.filter(r => r.kind === 'stored').length;
     if (storedCount === 0) {
       try {
         const topLevel = await fs.readdir(repoRoot, { withFileTypes: true });
