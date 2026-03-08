@@ -218,7 +218,7 @@ const SIGNALS: readonly SignalDefinition[] = [
     id: 'temporal',
     label: 'Temporal language',
     confidence: 'high',
-    test: (_title, content) => {
+    test: (_title, content, raw) => {
       const patterns = [
         /\bcurrently\b/, /\bright now\b/, /\bat the moment\b/,
         /\bas of today\b/, /\bas of now\b/, /\btoday\b/,
@@ -230,6 +230,9 @@ const SIGNALS: readonly SignalDefinition[] = [
         /\bas things stand\b/, /\bgiven the current state\b/,
         /\bstill (pending|waiting|blocked)\b/,
         /\blast time (i|we) (ran|checked|tested)\b/,
+        // Explicit dates — "created (2026-03-08)", "as of 2024-11-15", "(written 2023-05-22)"
+        /\b(created|written|updated|generated|completed|done|finished)\s*\(?\s*\d{4}-\d{2}-\d{2}\b/,
+        /\bas of \d{4}-\d{2}-\d{2}\b/,
       ];
       const m = firstMatch(content, patterns);
       return m ? `contains "${m[0]}"` : undefined;
@@ -305,7 +308,7 @@ const SIGNALS: readonly SignalDefinition[] = [
     test: (title, content) => {
       const titlePatterns = [
         // "Documentation updates complete", "migration done", "task finished"
-        /\b(update|migration|refactor|implementation|task|feature|docs?|documentation|sync|work|changes?|setup)\s+(complete[d]?|done|finished?)\b/,
+        /\b(update|migration|refactor|implementation|task|feature|docs?|documentation|sync|work|changes?|setup|design|plan|spec|proposal)\s+(complete[d]?|done|finished?)\b/,
         // "Complete: X" or "Done - X" as a status prefix in the title
         /^(complete[d]?|done|finished?)\s*[-–—:]/,
       ];
@@ -342,6 +345,10 @@ const SIGNALS: readonly SignalDefinition[] = [
         /\b\d+\s+additions?,\s*\d+\s+deletions?\b/,
         // Work quantity: "14 docs modified", "5 files changed"
         /\b\d+\s+(docs?|files?|tests?|endpoints?|functions?|modules?|classes?|pages?)\s+(modified|changed|updated|added|created|deleted)\b/,
+        // Summary stats: "Total 3200 lines", "12-15 new files", "13 edited"
+        /\btotal\s+\d+(-\d+)?\s+(lines?|files?|docs?|tests?|functions?)\b/,
+        /\b\d+(-\d+)?\s+new\s+(files?|docs?|tests?)\b/,
+        /\b\d+\s+edited\b/,
       ];
       const m = firstMatch(content, patterns);
       return m ? `"${m[0]}" — quantitative work metrics are session activity, not lasting knowledge` : undefined;
