@@ -39,6 +39,24 @@ describe('ephemeral detection', () => {
       assert.ok(signals.some(s => s.id === 'temporal'));
     });
 
+    it('detects explicit date patterns like "created (YYYY-MM-DD)"', () => {
+      const signals = detectEphemeralSignals(
+        'Design Documents',
+        'Three design documents created (2026-03-08) for the validation system.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'temporal'));
+    });
+
+    it('detects "as of YYYY-MM-DD" date pattern', () => {
+      const signals = detectEphemeralSignals(
+        'Status Update',
+        'As of 2026-03-08, all phases are defined.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'temporal'));
+    });
+
     it('does not flag durable content without temporal words', () => {
       const signals = detectEphemeralSignals(
         'MVI Architecture',
@@ -761,6 +779,24 @@ describe('ephemeral detection', () => {
       assert.ok(signals.length > 0, `Expected at least one signal, got none`);
     });
 
+    it('detects "design complete" in title', () => {
+      const signals = detectEphemeralSignals(
+        'God-tier validation detailed design complete',
+        'Three design documents created for the validation system.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'completed-task'));
+    });
+
+    it('detects "plan complete" in title', () => {
+      const signals = detectEphemeralSignals(
+        'Implementation plan complete',
+        'The plan covers all phases and acceptance criteria.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'completed-task'));
+    });
+
     it('detects task-noun + "complete" in title', () => {
       const signals = detectEphemeralSignals(
         'Database migration complete',
@@ -868,6 +904,24 @@ describe('ephemeral detection', () => {
       const signals = detectEphemeralSignals(
         'Doc Sprint',
         '14 docs modified to reflect the new module structure.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'diff-stats'));
+    });
+
+    it('detects "Total X lines" summary metrics', () => {
+      const signals = detectEphemeralSignals(
+        'Design Work Summary',
+        'Created three design documents. Total 3200 lines covering all phases.',
+        'architecture',
+      );
+      assert.ok(signals.some(s => s.id === 'diff-stats'));
+    });
+
+    it('detects "N new files" summary metrics', () => {
+      const signals = detectEphemeralSignals(
+        'Refactor Summary',
+        'Completed the refactor. 12-15 new files, 13 edited.',
         'architecture',
       );
       assert.ok(signals.some(s => s.id === 'diff-stats'));
