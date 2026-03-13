@@ -48,6 +48,24 @@ export const OPPOSITION_PAIRS: ReadonlyArray<readonly [string, string]> = [
   ['imperative', 'declarative'],
 ];
 
+/** Minimum cosine similarity for semantic search results.
+ *  Below this, entries are noise — embedding models produce non-zero similarity
+ *  even for unrelated text.
+ *
+ *  CALIBRATION NOTE: 0.45 is a strict starting point. With nomic-embed-text,
+ *  unrelated text pairs routinely score 0.2-0.4 because the model produces
+ *  non-orthogonal embeddings for any English text. Starting strict and loosening
+ *  with data is safer than starting loose.
+ *
+ *  Use MEMORY_MCP_DEBUG=1 env var to see raw cosine scores for calibration. */
+export const SEMANTIC_MIN_SIMILARITY = 0.45;
+
+/** Minimum cosine similarity for semantic dedup at store time.
+ *  Higher than SEMANTIC_MIN_SIMILARITY because flagging false duplicates is more
+ *  disruptive than missing real ones. Two entries must be quite similar to be
+ *  flagged as potential duplicates. */
+export const DEDUP_SEMANTIC_THRESHOLD = 0.80;
+
 /** Score multiplier when a reference path basename matches the context keywords. */
 export const REFERENCE_BOOST_MULTIPLIER = 1.30;
 

@@ -17,12 +17,15 @@ import { DEFAULT_CONFIDENCE, realClock, parseTopicScope, parseTrustLevel, parseT
 import type { Embedder } from './embedder.js';
 import {
   DEDUP_SIMILARITY_THRESHOLD,
+  DEDUP_SEMANTIC_THRESHOLD,
+  SEMANTIC_MIN_SIMILARITY,
   CONFLICT_SIMILARITY_THRESHOLD_SAME_TOPIC,
   CONFLICT_SIMILARITY_THRESHOLD_CROSS_TOPIC,
   CONFLICT_MIN_CONTENT_CHARS,
   OPPOSITION_PAIRS,
   PREFERENCE_SURFACE_THRESHOLD,
   TOPIC_BOOST,
+  MODULE_TOPIC_BOOST,
   USER_ALWAYS_INCLUDE_SCORE_FRACTION,
   DEFAULT_STALE_DAYS_STANDARD,
   DEFAULT_STALE_DAYS_PREFERENCES,
@@ -33,9 +36,9 @@ import {
 } from './thresholds.js';
 import { realGitService } from './git-service.js';
 import {
-  extractKeywords, similarity, matchesFilter, computeRelevanceScore,
+  extractKeywords, similarity, cosineSimilarity, matchesFilter, computeRelevanceScore,
 } from './text-analyzer.js';
-import { keywordRank } from './ranking.js';
+import { keywordRank, semanticRank, mergeRankings } from './ranking.js';
 import type { ScoredEntry, RankContext } from './ranking.js';
 import { detectEphemeralSignals, formatEphemeralWarning, getEphemeralSeverity } from './ephemeral.js';
 
@@ -158,8 +161,24 @@ export class MarkdownMemoryStore {
     const file = this.entryToRelativePath(entry);
     await this.persistEntry(entry);
 
-    // Dedup: find related entries in the same topic (excluding the one just stored and any overwritten)
-    const relatedEntries = this.findRelatedEntries(entry, existing?.id);
+    // Embed and persist vector — awaited so .vec exists when store() returns
+    if (this.embedder) {
+      const embedText = `${title}\n\n${content}`;
+      const embedResult = await this.embedder.embed(embedText);
+      if (embedResult.ok) {
+        await this.persistVector(file, embedResult.vector);
+        this.vectors.set(entry.id, embedResult.vector);
+      } else {
+        process.stderr.write(
+          `[memory-mcp] Embedding failed for ${entry.id}: ${embedResult.failure.kind}\n`
+        );
+      }
+    }
+
+    // Dedup: merge keyword-based and semantic-based duplicate detection
+    const keywordDupes = this.findRelatedEntries(entry, existing?.id);
+    const semanticDupes = this.findSemanticDuplicates(entry.id, topic);
+    const relatedEntries = this.mergeRelatedEntries(keywordDupes, semanticDupes);
 
     // Surface relevant preferences if storing a non-preference entry
     const relevantPreferences = (topic !== 'preferences' && topic !== 'user')
@@ -406,6 +425,21 @@ export class MarkdownMemoryStore {
     this.entries.set(id, updated);
     await this.persistEntry(updated);
 
+    // Re-embed: content changed, old vector is stale
+    if (this.embedder) {
+      const embedText = `${updated.title}\n\n${updated.content}`;
+      const embedResult = await this.embedder.embed(embedText);
+      if (embedResult.ok) {
+        const updatedFile = this.entryToRelativePath(updated);
+        await this.persistVector(updatedFile, embedResult.vector);
+        this.vectors.set(updated.id, embedResult.vector);
+      } else {
+        process.stderr.write(
+          `[memory-mcp] Re-embedding failed for ${updated.id}: ${embedResult.failure.kind}\n`
+        );
+      }
+    }
+
     return { corrected: true, id, action, newConfidence: 1.0, trust: 'user' };
   }
 
@@ -549,8 +583,12 @@ export class MarkdownMemoryStore {
 
   // --- Contextual search (memory_context) ---
 
-  /** Search across all topics using keyword matching with topic-based boosting.
-   *  Orchestrator: reload, extract keywords, delegate to keywordRank, apply policies.
+  /** Search across all topics using keyword + semantic ranking with topic-based boosting.
+   *  Orchestrator: reload, extract keywords, embed query, rank, merge, apply policies.
+   *
+   *  Graceful degradation: when embedder is null or embed fails, semantic results
+   *  are empty and merge produces keyword-only results — identical to pre-embedding behavior.
+   *
    *  @param minMatch Minimum ratio of context keywords that must match (0-1, default 0.2) */
   async contextSearch(
     context: string,
@@ -562,12 +600,15 @@ export class MarkdownMemoryStore {
     await this.reloadFromDisk();
 
     const contextKeywords = extractKeywords(context);
-    if (contextKeywords.size === 0) return [];
+
+    // Only bail on zero keywords when there's no embedder to fall back on.
+    // Stopword-heavy queries produce zero keywords but can yield semantic results.
+    if (contextKeywords.size === 0 && !this.embedder) return [];
 
     const currentBranch = branchFilter || await this.getCurrentBranch();
     const allEntries = Array.from(this.entries.values());
 
-    // Precompute freshness set — keeps keywordRank provably pure (no callbacks)
+    // Precompute freshness set — keeps ranking functions provably pure (no callbacks)
     const freshEntryIds = new Set<string>();
     for (const entry of allEntries) {
       if (this.isFresh(entry)) freshEntryIds.add(entry.id);
@@ -578,15 +619,56 @@ export class MarkdownMemoryStore {
       branchFilter,
       topicBoost: TOPIC_BOOST,
       freshEntryIds,
+      defaultModuleBoost: MODULE_TOPIC_BOOST,
     };
 
-    const ranked = keywordRank(allEntries, contextKeywords, minMatch, ctx);
+    // Keyword ranking (may be empty for stopword-heavy queries)
+    const keywordResults = contextKeywords.size > 0
+      ? keywordRank(allEntries, contextKeywords, minMatch, ctx)
+      : [];
 
-    // Policy: always include user entries even if no keyword match
-    const results: ScoredEntry[] = [...ranked];
+    // Semantic ranking (only if embedder available and query embeds successfully)
+    const debug = process.env.MEMORY_MCP_DEBUG === '1';
+    let semanticResults: readonly ScoredEntry[] = [];
+    if (this.embedder) {
+      const queryResult = await this.embedder.embed(context);
+      if (queryResult.ok) {
+        // In debug mode, get ALL scores (threshold=0) for calibration logging
+        const rawSemanticResults = semanticRank(
+          allEntries, this.vectors, queryResult.vector,
+          debug ? 0 : SEMANTIC_MIN_SIMILARITY,
+          ctx,
+        );
+
+        if (debug) {
+          for (const r of rawSemanticResults) {
+            const included = (r.semanticSimilarity ?? 0) >= SEMANTIC_MIN_SIMILARITY;
+            process.stderr.write(
+              `[memory-mcp:debug] semantic ${(r.semanticSimilarity ?? 0).toFixed(3)} ${r.entry.id} "${r.entry.title}"${included ? '' : ' ← below threshold'}\n`
+            );
+          }
+          // Filter to threshold after logging all scores
+          semanticResults = rawSemanticResults.filter(r => (r.semanticSimilarity ?? 0) >= SEMANTIC_MIN_SIMILARITY);
+        } else {
+          semanticResults = rawSemanticResults;
+        }
+      }
+      // If embed fails: semanticResults stays empty, keyword results used alone
+    }
+
+    // Merge keyword + semantic results using max-score strategy
+    const merged = mergeRankings(keywordResults, semanticResults);
+
+    // Policy: always include user entries even if no keyword/semantic match
+    const results: ScoredEntry[] = [...merged];
     for (const entry of this.entries.values()) {
       if (entry.topic === 'user' && !results.find(r => r.entry.id === entry.id)) {
-        results.push({ entry, score: entry.confidence * USER_ALWAYS_INCLUDE_SCORE_FRACTION, matchedKeywords: [] });
+        results.push({
+          entry,
+          score: entry.confidence * USER_ALWAYS_INCLUDE_SCORE_FRACTION,
+          matchedKeywords: [],
+          source: 'keyword',
+        });
       }
     }
 
@@ -1095,6 +1177,52 @@ export class MarkdownMemoryStore {
         confidence: r.entry.confidence,
         trust: r.entry.trust,
       }));
+  }
+
+  /** Find semantic duplicates by cosine similarity against stored vectors.
+   *  Same-topic only. Returns entries above DEDUP_SEMANTIC_THRESHOLD.
+   *  Returns empty when no embedder or no vectors available. */
+  private findSemanticDuplicates(excludeId: string, topic: TopicScope): RelatedEntry[] {
+    const newVector = this.vectors.get(excludeId);
+    if (!newVector) return [];
+
+    const related: Array<{ entry: MemoryEntry; similarity: number }> = [];
+
+    for (const entry of this.entries.values()) {
+      if (entry.id === excludeId) continue;
+      if (entry.topic !== topic) continue;
+
+      const entryVector = this.vectors.get(entry.id);
+      if (!entryVector) continue;
+
+      const sim = cosineSimilarity(newVector, entryVector);
+      if (sim > DEDUP_SEMANTIC_THRESHOLD) {
+        related.push({ entry, similarity: sim });
+      }
+    }
+
+    return related
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, this.behavior.maxDedupSuggestions)
+      .map(r => ({
+        id: r.entry.id,
+        title: r.entry.title,
+        content: r.entry.content,
+        confidence: r.entry.confidence,
+        trust: r.entry.trust,
+      }));
+  }
+
+  /** Merge keyword-based and semantic-based dedup results, dedup by ID,
+   *  keeping the entry with higher similarity score. */
+  private mergeRelatedEntries(keywordDupes: RelatedEntry[], semanticDupes: RelatedEntry[]): RelatedEntry[] {
+    const byId = new Map<string, RelatedEntry>();
+    for (const r of keywordDupes) byId.set(r.id, r);
+    for (const r of semanticDupes) {
+      if (!byId.has(r.id)) byId.set(r.id, r);
+      // If already present from keyword dedup, keep whichever — both indicate duplication
+    }
+    return Array.from(byId.values()).slice(0, this.behavior.maxDedupSuggestions);
   }
 
   /** Tag frequency across all entries — for vocabulary echo in store responses.
