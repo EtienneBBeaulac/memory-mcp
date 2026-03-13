@@ -25,7 +25,7 @@ import {
   readCrashHistory, clearLatestCrash, formatCrashReport, formatCrashSummary,
   markServerStarted, type CrashContext, type CrashReport,
 } from './crash-journal.js';
-import { formatStaleSection, formatConflictWarning, formatStats, formatBehaviorConfigSection, mergeTagFrequencies, buildQueryFooter, buildBriefingTagPrimerSections } from './formatters.js';
+import { formatStaleSection, formatConflictWarning, formatStats, formatBehaviorConfigSection, mergeTagFrequencies, buildQueryFooter, buildBriefingTagPrimerSections, formatSearchMode } from './formatters.js';
 import { parseFilter, type FilterGroup } from './text-analyzer.js';
 import { VOCABULARY_ECHO_LIMIT, MAX_FOOTER_TAGS, WARN_SEPARATOR } from './thresholds.js';
 import { matchRootsToLobeNames, buildLobeResolution, type LobeResolution, type LobeRootConfig } from './lobe-resolution.js';
@@ -460,6 +460,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     // memory_diagnose is intentionally hidden from the tool list — it clutters
     // agent tool discovery and should only be called when directed by error messages
     // or crash reports. The handler still works if called directly.
+    // memory_reembed is hidden — utility for generating/regenerating embeddings.
+    // Surfaced via hint in memory_context when >50% of entries lack vectors.
   ] };
 });
 
@@ -1076,10 +1078,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const noResultHint = ctxGlobalOnlyHint
             ? `\n\n> ${ctxGlobalOnlyHint}`
             : '\n\nThis is fine — proceed without prior context. As you learn things worth remembering, store them with memory_store.';
+          // Mode indicator on no-results path — helps diagnose why nothing was found
+          const modeHint = primaryStore
+            ? `\n${formatSearchMode(primaryStore.hasEmbedder, primaryStore.vectorCount, primaryStore.entryCount)}`
+            : '';
           return {
             content: [{
               type: 'text',
-              text: `[${label}] No relevant knowledge found for: "${context}"${noResultHint}\n\n---\n${ctxFooter}`,
+              text: `[${label}] No relevant knowledge found for: "${context}"${noResultHint}${modeHint}\n\n---\n${ctxFooter}`,
             }],
           };
         }
@@ -1127,6 +1133,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (ctxConflicts.length > 0) {
             sections.push(formatConflictWarning(ctxConflicts));
           }
+        }
+
+        // Search mode indicator — lightweight getters, no extra disk reload
+        if (primaryStore) {
+          sections.push(formatSearchMode(
+            primaryStore.hasEmbedder,
+            primaryStore.vectorCount,
+            primaryStore.entryCount,
+          ));
         }
 
         // Collect all matched keywords and topics for the dedup hint
@@ -1186,6 +1201,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         return { content: [{ type: 'text', text: sections.join('\n\n---\n\n') }] };
+      }
+
+      case 'memory_reembed': {
+        const { lobe: rawLobe } = z.object({
+          lobe: z.string().optional(),
+        }).parse(args ?? {});
+
+        const lobeName = rawLobe ?? lobeNames[0];
+        const ctx = resolveToolContext(lobeName);
+        if (!ctx.ok) return contextError(ctx);
+
+        const result = await ctx.store.reEmbed();
+
+        if (result.error) {
+          return { content: [{ type: 'text', text: `[${ctx.label}] Re-embed failed: ${result.error}` }] };
+        }
+
+        const parts = [
+          `[${ctx.label}] Re-embedded ${result.embedded} entries`,
+          `(${result.skipped} skipped, ${result.failed} failed).`,
+        ];
+
+        // Hint if many entries were vectorized
+        if (result.embedded > 0) {
+          parts.push('\nSemantic search is now active for these entries.');
+        }
+
+        return { content: [{ type: 'text', text: parts.join(' ') }] };
       }
 
       case 'memory_bootstrap': {

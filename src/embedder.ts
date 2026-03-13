@@ -198,6 +198,73 @@ function trigramHash(trigram: string, buckets: number): number {
   return ((hash % buckets) + buckets) % buckets;
 }
 
+// ─── LazyEmbedder ─────────────────────────────────────────────────────────
+
+/** Default reprobe interval — how long to wait before retrying after a failed probe.
+ *  2 minutes balances responsiveness (recovery after Ollama starts) with
+ *  avoiding excessive probes when Ollama isn't installed. */
+const DEFAULT_REPROBE_INTERVAL_MS = 2 * 60 * 1000;
+
+/** Lazy auto-detecting embedder — probes on first use, caches the result.
+ *  Re-probes on failure after a TTL window so the system recovers if
+ *  Ollama starts after MCP startup.
+ *
+ *  Implements the same Embedder interface — the store never knows it's lazy.
+ *  The probe uses the candidate's own timeout (5s for cold starts).
+ *  The caller's signal is only forwarded to the actual embed call, not the probe. */
+export class LazyEmbedder implements Embedder {
+  readonly dimensions: number;
+  private inner: Embedder | null = null;
+  private lastProbeTime: number = -Infinity;
+  private hasLoggedUnavailable: boolean = false;
+  private readonly candidate: Embedder;
+  private readonly reprobeIntervalMs: number;
+  private readonly now: () => number;
+
+  constructor(candidate: Embedder, opts?: {
+    readonly reprobeIntervalMs?: number;
+    /** Injectable clock for testing — default Date.now */
+    readonly now?: () => number;
+  }) {
+    this.candidate = candidate;
+    this.dimensions = candidate.dimensions;
+    this.reprobeIntervalMs = opts?.reprobeIntervalMs ?? DEFAULT_REPROBE_INTERVAL_MS;
+    this.now = opts?.now ?? Date.now;
+  }
+
+  async embed(text: string, signal?: AbortSignal): Promise<EmbedResult> {
+    const now = this.now();
+    const shouldProbe = !this.inner && (now - this.lastProbeTime >= this.reprobeIntervalMs);
+
+    if (shouldProbe) {
+      this.lastProbeTime = now;
+      // Probe without caller's signal — use candidate's default timeout (5s)
+      // so cold model loads aren't aborted by a tight query-time timeout
+      const probe = await this.candidate.embed('probe');
+      if (probe.ok) {
+        this.inner = this.candidate;
+        if (this.hasLoggedUnavailable) {
+          // Recovery after previous failure — notify
+          process.stderr.write('[memory-mcp] Embedding provider recovered — semantic search active\n');
+          this.hasLoggedUnavailable = false;
+        }
+      } else if (!this.hasLoggedUnavailable) {
+        // Only log first failure — avoid noisy repeated warnings
+        process.stderr.write(
+          `[memory-mcp] Embedding provider not available — using keyword-only search (will retry in ${Math.round(this.reprobeIntervalMs / 1000)}s)\n`
+        );
+        this.hasLoggedUnavailable = true;
+      }
+    }
+
+    if (!this.inner) {
+      return { ok: false, failure: { kind: 'provider-unavailable', reason: 'auto-detect: provider not available' } };
+    }
+
+    return this.inner.embed(text, signal);
+  }
+}
+
 // ─── Batch utility ────────────────────────────────────────────────────────
 
 /** Batch embed texts sequentially. Pure composition over Embedder.embed().

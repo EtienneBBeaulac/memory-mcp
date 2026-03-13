@@ -9,7 +9,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import type {
   MemoryEntry, TopicScope, TrustLevel, DetailLevel, Tag, DurabilityDecision,
-  QueryResult, QueryEntry, StoreResult, CorrectResult, MemoryStats,
+  QueryResult, QueryEntry, StoreResult, CorrectResult, MemoryStats, ReEmbedResult,
   BriefingResult, StaleEntry, ConflictPair, MemoryConfig, RelatedEntry, Clock, GitService,
   EmbeddingVector,
 } from './types.js';
@@ -27,6 +27,7 @@ import {
   TOPIC_BOOST,
   MODULE_TOPIC_BOOST,
   USER_ALWAYS_INCLUDE_SCORE_FRACTION,
+  QUERY_EMBED_TIMEOUT_MS,
   DEFAULT_STALE_DAYS_STANDARD,
   DEFAULT_STALE_DAYS_PREFERENCES,
   DEFAULT_MAX_STALE_IN_BRIEFING,
@@ -75,6 +76,23 @@ export class MarkdownMemoryStore {
       maxDedupSuggestions: b.maxDedupSuggestions ?? DEFAULT_MAX_DEDUP_SUGGESTIONS,
       maxConflictPairs: b.maxConflictPairs ?? DEFAULT_MAX_CONFLICT_PAIRS,
     };
+  }
+
+  /** Whether an embedder is configured — for mode indicator display. Read-only. */
+  get hasEmbedder(): boolean {
+    return this.embedder !== null;
+  }
+
+  /** Count of vectorized entries — lightweight, no disk reload.
+   *  For mode indicator display. Use stats() for full diagnostics. */
+  get vectorCount(): number {
+    return this.vectors.size;
+  }
+
+  /** Count of total entries — lightweight, no disk reload.
+   *  For mode indicator display. Use stats() for full diagnostics. */
+  get entryCount(): number {
+    return this.entries.size;
   }
 
   /** Initialize the store: create memory dir and load existing entries */
@@ -443,6 +461,51 @@ export class MarkdownMemoryStore {
     return { corrected: true, id, action, newConfidence: 1.0, trust: 'user' };
   }
 
+  /** Re-embed all entries that don't have vectors.
+   *  Idempotent: entries already in the vectors map are skipped.
+   *  Early-exit: if the first embed fails, returns immediately (avoids burning through
+   *  all entries just to discover the embedder is unavailable). */
+  async reEmbed(): Promise<ReEmbedResult> {
+    if (!this.embedder) {
+      return { embedded: 0, skipped: 0, failed: 0, error: 'No embedder configured' };
+    }
+
+    await this.reloadFromDisk();
+
+    // Probe: try embedding a short text to check availability before iterating
+    const probe = await this.embedder.embed('probe');
+    if (!probe.ok) {
+      return { embedded: 0, skipped: 0, failed: 0, error: `Embedder unavailable: ${probe.failure.kind}` };
+    }
+
+    let embedded = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (const entry of this.entries.values()) {
+      // Entry already has a vector with correct dimensions — skip
+      if (this.vectors.has(entry.id)) {
+        skipped++;
+        continue;
+      }
+
+      // Embed the entry
+      const embedText = `${entry.title}\n\n${entry.content}`;
+      const result = await this.embedder.embed(embedText);
+
+      if (result.ok) {
+        const file = this.entryToRelativePath(entry);
+        await this.persistVector(file, result.vector);
+        this.vectors.set(entry.id, result.vector);
+        embedded++;
+      } else {
+        failed++;
+      }
+    }
+
+    return { embedded, skipped, failed };
+  }
+
   /** Get memory health statistics */
   async stats(): Promise<MemoryStats> {
     await this.reloadFromDisk();
@@ -478,6 +541,7 @@ export class MarkdownMemoryStore {
     return {
       totalEntries: allEntries.length,
       corruptFiles: this.corruptFileCount,
+      vectorCount: this.vectors.size,
       byTopic, byTrust, byFreshness, byTag,
       storageSize: this.formatBytes(storageSize ?? 0),
       storageBudgetBytes: this.config.storageBudgetBytes,
@@ -631,7 +695,8 @@ export class MarkdownMemoryStore {
     const debug = process.env.MEMORY_MCP_DEBUG === '1';
     let semanticResults: readonly ScoredEntry[] = [];
     if (this.embedder) {
-      const queryResult = await this.embedder.embed(context);
+      const querySignal = AbortSignal.timeout(QUERY_EMBED_TIMEOUT_MS);
+      const queryResult = await this.embedder.embed(context, querySignal);
       if (queryResult.ok) {
         // In debug mode, get ALL scores (threshold=0) for calibration logging
         const rawSemanticResults = semanticRank(

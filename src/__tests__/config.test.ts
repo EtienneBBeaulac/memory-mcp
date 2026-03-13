@@ -9,7 +9,9 @@ import assert from 'node:assert';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
-import { getLobeConfigs, parseBehaviorConfig } from '../config.js';
+import { getLobeConfigs, parseBehaviorConfig, parseEmbedderConfig, createEmbedderFromConfig } from '../config.js';
+import { LazyEmbedder } from '../embedder.js';
+import { formatSearchMode } from '../formatters.js';
 
 // Save original env vars so we can restore after each test
 const originalEnv: Record<string, string | undefined> = {};
@@ -252,6 +254,111 @@ describe('getLobeConfigs', () => {
 
       const unknownWarnings = stderrWrites.filter(s => s.includes('Unknown behavior config key'));
       assert.strictEqual(unknownWarnings.length, 0, 'Should not warn for valid keys');
+    });
+  });
+
+  describe('embedder config parsing', () => {
+    it('returns undefined when no embedder block', () => {
+      assert.strictEqual(parseEmbedderConfig(undefined), undefined);
+    });
+
+    it('parses valid ollama config', () => {
+      const result = parseEmbedderConfig({ provider: 'ollama', model: 'nomic-embed-text', baseUrl: 'http://localhost:11434' });
+      assert.ok(result);
+      assert.strictEqual(result.provider, 'ollama');
+      assert.strictEqual(result.model, 'nomic-embed-text');
+      assert.strictEqual(result.baseUrl, 'http://localhost:11434');
+    });
+
+    it('parses provider "none"', () => {
+      const result = parseEmbedderConfig({ provider: 'none' });
+      assert.ok(result);
+      assert.strictEqual(result.provider, 'none');
+    });
+
+    it('defaults provider to ollama when missing', () => {
+      const result = parseEmbedderConfig({ model: 'custom-model' });
+      assert.ok(result);
+      assert.strictEqual(result.provider, 'ollama');
+      assert.strictEqual(result.model, 'custom-model');
+    });
+
+    it('falls back to ollama for unknown provider', () => {
+      const result = parseEmbedderConfig({ provider: 'openai' });
+      assert.ok(result);
+      assert.strictEqual(result.provider, 'ollama');
+    });
+
+    it('clamps out-of-range timeoutMs', () => {
+      const tooLow = parseEmbedderConfig({ timeoutMs: 100 });
+      assert.strictEqual(tooLow?.timeoutMs, 5000);
+
+      const tooHigh = parseEmbedderConfig({ timeoutMs: 60000 });
+      assert.strictEqual(tooHigh?.timeoutMs, 5000);
+    });
+
+    it('clamps out-of-range dimensions', () => {
+      const tooLow = parseEmbedderConfig({ dimensions: 10 });
+      assert.strictEqual(tooLow?.dimensions, 384);
+    });
+
+    it('warns on unknown keys', () => {
+      const stderrWrites: string[] = [];
+      const origWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+        if (typeof chunk === 'string') stderrWrites.push(chunk);
+        return origWrite(chunk as never, ...(rest as never[]));
+      }) as typeof process.stderr.write;
+
+      try {
+        parseEmbedderConfig({ provider: 'ollama', apiKey: 'secret' } as never);
+      } finally {
+        process.stderr.write = origWrite;
+      }
+
+      const warnings = stderrWrites.filter(s => s.includes('Unknown embedder config key'));
+      assert.ok(warnings.length > 0, 'Should warn about unknown key "apiKey"');
+    });
+  });
+
+  describe('createEmbedderFromConfig', () => {
+    it('returns undefined for provider "none"', () => {
+      const result = createEmbedderFromConfig({ provider: 'none' });
+      assert.strictEqual(result, undefined);
+    });
+
+    it('returns LazyEmbedder for provider "ollama"', () => {
+      const result = createEmbedderFromConfig({ provider: 'ollama' });
+      assert.ok(result instanceof LazyEmbedder);
+    });
+
+    it('returns LazyEmbedder for auto-detect (no config)', () => {
+      const result = createEmbedderFromConfig(undefined);
+      assert.ok(result instanceof LazyEmbedder);
+    });
+  });
+
+  describe('formatSearchMode', () => {
+    it('shows keyword-only when no embedder', () => {
+      const result = formatSearchMode(false, 0, 10);
+      assert.ok(result.includes('keyword-only'));
+    });
+
+    it('shows semantic + keyword with coverage', () => {
+      const result = formatSearchMode(true, 47, 52);
+      assert.ok(result.includes('semantic + keyword'));
+      assert.ok(result.includes('47/52'));
+    });
+
+    it('shows reembed hint when zero vectors', () => {
+      const result = formatSearchMode(true, 0, 47);
+      assert.ok(result.includes('memory_reembed'));
+      assert.ok(result.includes('0/47'));
+    });
+
+    it('handles empty store', () => {
+      const result = formatSearchMode(true, 0, 0);
+      assert.ok(result.includes('no entries yet'));
     });
   });
 
