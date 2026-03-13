@@ -1,10 +1,12 @@
 // Pure text analysis: stemming, keyword extraction, similarity, filter parsing.
 // Stateless — all functions are pure. No I/O, no side effects.
 //
-// Design: this module is the seam for future search strategies.
+// Design: this module is the seam for search strategies.
 // v1: keyword matching with naive stemming (this file)
-// v2: spreading activation over a knowledge graph
-// v3: embedding-based cosine similarity
+// v2: embedding-based cosine similarity (this file + embedder.ts)
+// v3: graph-enriched retrieval (if proven needed — see graph-library-design.md)
+
+import type { EmbeddingVector } from './types.js';
 
 // Stopwords for keyword extraction — common English words with no semantic value
 const STOPWORDS = new Set([
@@ -143,6 +145,22 @@ export function containmentSimilarity(a: Set<string>, b: Set<string>): number {
     if (b.has(word)) intersection++;
   }
   return intersection / Math.min(a.size, b.size);
+}
+
+/** Cosine similarity between two embedding vectors.
+ *  Returns 0.0–1.0 for normalized vectors (most embedding models normalize output).
+ *  Returns 0 for zero vectors (not NaN) — no information means no similarity.
+ *
+ *  Pure function. No allocations beyond locals. ~1ms for 200 entries at 384 dims. */
+export function cosineSimilarity(a: EmbeddingVector, b: EmbeddingVector): number {
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom === 0 ? 0 : dot / denom;
 }
 
 /** Combined similarity: max(jaccard, containment) with title boost.

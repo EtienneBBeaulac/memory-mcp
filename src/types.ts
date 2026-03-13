@@ -5,6 +5,8 @@
 //   - Validate at boundaries, trust inside: parse functions at system edges
 //   - Explicit domain types over primitives where meaning matters
 
+import type { Embedder } from './embedder.js';
+
 /** Trust levels for knowledge sources, ordered by reliability */
 export type TrustLevel = 'user' | 'agent-confirmed' | 'agent-inferred';
 
@@ -34,6 +36,18 @@ const FIXED_TOPICS: readonly string[] = ['user', 'preferences', 'architecture', 
 /** Validated tag: lowercase alphanumeric slug (letters, digits, hyphens).
  *  Branded type prevents accidentally passing raw strings where validated tags are expected. */
 export type Tag = string & { readonly __brand: 'Tag' };
+
+/** Embedding vector — branded Float32Array to prevent passing arbitrary float arrays.
+ *  The brand carries domain intent: this is a valid embedding from a specific model,
+ *  not an arbitrary numeric buffer. Decoupled from embedder.ts so text-analyzer.ts
+ *  can import it without depending on the embedding provider. */
+export type EmbeddingVector = Float32Array & { readonly __brand: 'EmbeddingVector' };
+
+/** Construct an EmbeddingVector from a Float32Array. Boundary validation only —
+ *  callers (OllamaEmbedder, FakeEmbedder, vector deserialization) validate dimensions. */
+export function asEmbeddingVector(raw: Float32Array): EmbeddingVector {
+  return raw as EmbeddingVector;
+}
 
 const TAG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const MAX_TAG_LENGTH = 50;
@@ -288,6 +302,7 @@ export interface MemoryConfig {
   readonly behavior?: BehaviorConfig; // user-facing behavior thresholds
   readonly clock?: Clock;             // injectable clock for testing; defaults to realClock
   readonly git?: GitService;          // injectable git service; defaults to realGitService
+  readonly embedder?: Embedder;       // injectable embedder; absent = keyword-only mode
 }
 
 /** Default confidence values by trust level */

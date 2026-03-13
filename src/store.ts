@@ -11,8 +11,10 @@ import type {
   MemoryEntry, TopicScope, TrustLevel, DetailLevel, Tag, DurabilityDecision,
   QueryResult, QueryEntry, StoreResult, CorrectResult, MemoryStats,
   BriefingResult, StaleEntry, ConflictPair, MemoryConfig, RelatedEntry, Clock, GitService,
+  EmbeddingVector,
 } from './types.js';
-import { DEFAULT_CONFIDENCE, realClock, parseTopicScope, parseTrustLevel, parseTags } from './types.js';
+import { DEFAULT_CONFIDENCE, realClock, parseTopicScope, parseTrustLevel, parseTags, asEmbeddingVector } from './types.js';
+import type { Embedder } from './embedder.js';
 import {
   DEDUP_SIMILARITY_THRESHOLD,
   CONFLICT_SIMILARITY_THRESHOLD_SAME_TOPIC,
@@ -47,7 +49,9 @@ export class MarkdownMemoryStore {
   private readonly memoryPath: string;
   private readonly clock: Clock;
   private readonly git: GitService;
+  private readonly embedder: Embedder | null;
   private entries: Map<string, MemoryEntry> = new Map();
+  private vectors: Map<string, EmbeddingVector> = new Map();
   private corruptFileCount: number = 0;
 
   constructor(config: MemoryConfig) {
@@ -55,6 +59,7 @@ export class MarkdownMemoryStore {
     this.memoryPath = config.memoryPath;
     this.clock = config.clock ?? realClock;
     this.git = config.git ?? realGitService;
+    this.embedder = config.embedder ?? null;
   }
 
   /** Resolved behavior thresholds — user config merged over defaults.
@@ -699,6 +704,9 @@ export class MarkdownMemoryStore {
     const fullPath = path.join(this.memoryPath, relativePath);
     try { await fs.unlink(fullPath); } catch { /* already gone */ }
 
+    // Delete companion .vec file if it exists
+    await this.deleteVector(relativePath);
+
     // Clean up empty parent directories
     try {
       const dir = path.dirname(fullPath);
@@ -709,10 +717,163 @@ export class MarkdownMemoryStore {
     } catch { /* ignore */ }
   }
 
+  // ─── Vector sidecar storage ─────────────────────────────────────────────
+  // Sidecar .vec files alongside .md entries. Embeddings are a cache — delete
+  // all .vec files and the system degrades to keyword search. Non-atomic with
+  // .md writes (both failure modes are benign since vectors are derived data).
+
+  /** .vec file format version — future-proofs for metadata additions.
+   *  v1: [u8 version=0x01][u32LE dimensions][f32LE × dimensions] */
+  private static readonly VEC_FORMAT_VERSION = 0x01;
+
+  /** Write a vector sidecar file for an entry.
+   *  Format: [u8 version][u32LE dims][f32LE × dims]. Total: 5 + dims*4 bytes. */
+  private async persistVector(relativePath: string, vector: EmbeddingVector): Promise<void> {
+    const vecPath = this.vecPathFromMdPath(relativePath);
+    const buf = Buffer.alloc(5 + vector.length * 4);
+
+    buf.writeUInt8(MarkdownMemoryStore.VEC_FORMAT_VERSION, 0);
+    buf.writeUInt32LE(vector.length, 1);
+
+    for (let i = 0; i < vector.length; i++) {
+      buf.writeFloatLE(vector[i], 5 + i * 4);
+    }
+
+    await fs.mkdir(path.dirname(vecPath), { recursive: true });
+    await fs.writeFile(vecPath, buf);
+  }
+
+  /** Load and validate a vector sidecar file.
+   *  Returns null on: missing file, unknown version, wrong dimensions, corrupt size.
+   *  Null is not an error — it means the entry works via keyword fallback. */
+  private async loadVector(relativePath: string): Promise<EmbeddingVector | null> {
+    if (!this.embedder) return null;
+
+    const vecPath = this.vecPathFromMdPath(relativePath);
+    let buf: Buffer;
+    try {
+      buf = await fs.readFile(vecPath);
+    } catch {
+      return null; // missing — entry predates embeddings
+    }
+
+    // Minimum valid size: 1 (version) + 4 (dims) = 5 bytes
+    if (buf.length < 5) {
+      process.stderr.write(`[memory-mcp] Corrupt .vec file (too small): ${vecPath}\n`);
+      return null;
+    }
+
+    const version = buf.readUInt8(0);
+    if (version !== MarkdownMemoryStore.VEC_FORMAT_VERSION) {
+      process.stderr.write(`[memory-mcp] Unknown .vec version ${version}: ${vecPath}\n`);
+      return null;
+    }
+
+    const storedDims = buf.readUInt32LE(1);
+    if (storedDims !== this.embedder.dimensions) {
+      // Dimension mismatch — model changed. Entry needs re-embed, not an error.
+      process.stderr.write(
+        `[memory-mcp] Dimension mismatch in ${vecPath}: stored ${storedDims}, expected ${this.embedder.dimensions}\n`
+      );
+      return null;
+    }
+
+    const expectedSize = 5 + storedDims * 4;
+    if (buf.length !== expectedSize) {
+      process.stderr.write(
+        `[memory-mcp] Corrupt .vec file (expected ${expectedSize} bytes, got ${buf.length}): ${vecPath}\n`
+      );
+      return null;
+    }
+
+    const raw = new Float32Array(storedDims);
+    for (let i = 0; i < storedDims; i++) {
+      raw[i] = buf.readFloatLE(5 + i * 4);
+    }
+
+    return asEmbeddingVector(raw);
+  }
+
+  /** Delete a vector sidecar file. Fire-and-forget — failure is harmless. */
+  private async deleteVector(mdRelativePath: string): Promise<void> {
+    const vecPath = this.vecPathFromMdPath(mdRelativePath);
+    try { await fs.unlink(vecPath); } catch { /* already gone or never existed */ }
+  }
+
+  /** Derive the .vec path from a .md relative path */
+  private vecPathFromMdPath(mdRelativePath: string): string {
+    const vecRelative = mdRelativePath.replace(/\.md$/, '.vec');
+    return path.join(this.memoryPath, vecRelative);
+  }
+
+  /** Load vectors for all known entries. Cleans up orphan .vec files.
+   *  Skipped entirely when embedder is null (no wasted I/O).
+   *  Returns a fresh map — no mutation of store state. */
+  private async loadVectorSnapshot(
+    entries: ReadonlyMap<string, MemoryEntry>,
+  ): Promise<ReadonlyMap<string, EmbeddingVector>> {
+    if (!this.embedder) return new Map();
+
+    const vectors = new Map<string, EmbeddingVector>();
+    const entryIds = new Set(entries.keys());
+
+    // Load vectors for known entries
+    for (const entry of entries.values()) {
+      const relativePath = this.entryToRelativePath(entry);
+      const vector = await this.loadVector(relativePath);
+      if (vector) {
+        vectors.set(entry.id, vector);
+      }
+    }
+
+    // Clean up orphan .vec files — entries deleted while embedder was unavailable
+    try {
+      const vecFiles = await this.findVecFiles(this.memoryPath);
+      for (const vecFile of vecFiles) {
+        const relativePath = path.relative(this.memoryPath, vecFile);
+        // Derive the entry ID: the .vec filename without extension matches the .md filename
+        const mdRelative = relativePath.replace(/\.vec$/, '.md');
+        // Check if any entry maps to this path
+        const hasMatchingEntry = Array.from(entries.values()).some(
+          e => this.entryToRelativePath(e) === mdRelative
+        );
+        if (!hasMatchingEntry) {
+          try {
+            await fs.unlink(vecFile);
+            process.stderr.write(`[memory-mcp] Cleaned up orphan .vec: ${relativePath}\n`);
+          } catch { /* ignore cleanup failures */ }
+        }
+      }
+    } catch { /* ignore — directory may not exist yet */ }
+
+    return vectors;
+  }
+
+  /** Recursively find all .vec files in a directory */
+  private async findVecFiles(dir: string): Promise<string[]> {
+    const results: string[] = [];
+    try {
+      const dirEntries = await fs.readdir(dir, { withFileTypes: true });
+      for (const dirEntry of dirEntries) {
+        const fullPath = path.join(dir, dirEntry.name);
+        if (dirEntry.isDirectory()) {
+          results.push(...await this.findVecFiles(fullPath));
+        } else if (dirEntry.name.endsWith('.vec')) {
+          results.push(fullPath);
+        }
+      }
+    } catch { /* ignore */ }
+    return results;
+  }
+
   /** Load all entries from disk and return as an immutable snapshot.
    *  Pure read — no mutation. Callers decide whether to cache.
    *  Tracks corrupt files for observability without failing the load. */
-  private async loadSnapshot(): Promise<{ readonly entries: ReadonlyMap<string, MemoryEntry>; readonly corruptFileCount: number }> {
+  private async loadSnapshot(): Promise<{
+    readonly entries: ReadonlyMap<string, MemoryEntry>;
+    readonly vectors: ReadonlyMap<string, EmbeddingVector>;
+    readonly corruptFileCount: number;
+  }> {
     const entries = new Map<string, MemoryEntry>();
     let corruptFileCount = 0;
 
@@ -731,7 +892,10 @@ export class MarkdownMemoryStore {
       // Empty memory — first run
     }
 
-    return { entries, corruptFileCount };
+    // Load vectors after entries — needs the entry map for orphan detection
+    const vectors = await this.loadVectorSnapshot(entries);
+
+    return { entries, vectors, corruptFileCount };
   }
 
   /** Reload entries from disk into the store's working state.
@@ -739,6 +903,7 @@ export class MarkdownMemoryStore {
   private async reloadFromDisk(): Promise<void> {
     const snapshot = await this.loadSnapshot();
     this.entries = new Map(snapshot.entries);
+    this.vectors = new Map(snapshot.vectors);
     this.corruptFileCount = snapshot.corruptFileCount;
   }
 
