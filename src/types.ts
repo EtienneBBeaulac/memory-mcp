@@ -35,6 +35,18 @@ const FIXED_TOPICS: readonly string[] = ['user', 'preferences', 'architecture', 
  *  Branded type prevents accidentally passing raw strings where validated tags are expected. */
 export type Tag = string & { readonly __brand: 'Tag' };
 
+/** Embedding vector — branded Float32Array to prevent passing arbitrary float arrays.
+ *  The brand carries domain intent: this is a valid embedding from a specific model,
+ *  not an arbitrary numeric buffer. Decoupled from embedder.ts so text-analyzer.ts
+ *  can import it without depending on the embedding provider. */
+export type EmbeddingVector = Float32Array & { readonly __brand: 'EmbeddingVector' };
+
+/** Construct an EmbeddingVector from a Float32Array. Boundary validation only —
+ *  callers (OllamaEmbedder, FakeEmbedder, vector deserialization) validate dimensions. */
+export function asEmbeddingVector(raw: Float32Array): EmbeddingVector {
+  return raw as EmbeddingVector;
+}
+
 const TAG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const MAX_TAG_LENGTH = 50;
 const MAX_TAGS_PER_ENTRY = 10;
