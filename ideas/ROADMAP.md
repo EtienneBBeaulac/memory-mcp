@@ -18,8 +18,7 @@ Piggyback hints on correct/store responses.
 - **Conflict detection**: cross-topic similarity check (>60%) on query/context results.
   Surfaces top 2 conflict pairs with consolidation guidance.
 - **MCP Resources**: `memory://lobes`, `memory://stats`, `memory://diagnostics`.
-  Old tools (`memory_list_lobes`, `memory_stats`, `memory_diagnose`) kept as
-  deprecated aliases. Shared builder functions (`buildLobeInfo`, `buildDiagnosticsText`).
+  Shared builder functions (`buildLobeInfo`, `buildDiagnosticsText`).
 - **`src/thresholds.ts`**: central named constants for all magic numbers. Internal
   algorithm thresholds (dedup, conflict, boost) separate from user-facing behavior
   defaults (stale days, max stale in briefing, max dedup/conflict caps).
