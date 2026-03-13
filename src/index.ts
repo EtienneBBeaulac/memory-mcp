@@ -9,6 +9,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import path from 'path';
@@ -25,8 +27,8 @@ import {
   readCrashHistory, clearLatestCrash, formatCrashReport, formatCrashSummary,
   markServerStarted, type CrashContext, type CrashReport,
 } from './crash-journal.js';
-import { formatStaleSection, formatConflictWarning, formatStats, formatBehaviorConfigSection, mergeTagFrequencies, buildQueryFooter, buildBriefingTagPrimerSections, formatSearchMode } from './formatters.js';
-import { parseFilter, type FilterGroup } from './text-analyzer.js';
+import { formatStaleSection, formatConflictWarning, formatStats, formatBehaviorConfigSection, mergeTagFrequencies, buildQueryFooter, buildBriefingTagPrimerSections, formatSearchMode, formatLootDrop } from './formatters.js';
+import { parseFilter, extractTitle, type FilterGroup } from './text-analyzer.js';
 import { VOCABULARY_ECHO_LIMIT, MAX_FOOTER_TAGS, WARN_SEPARATOR } from './thresholds.js';
 import { matchRootsToLobeNames, buildLobeResolution, type LobeResolution, type LobeRootConfig } from './lobe-resolution.js';
 
@@ -194,7 +196,7 @@ function inferLobeFromPaths(paths: readonly string[]): string | undefined {
 
 const server = new Server(
   { name: 'memory-mcp', version: '0.1.0' },
-  { capabilities: { tools: {} } }
+  { capabilities: { tools: {}, resources: {} } }
 );
 
 // --- Lobe resolution for read operations ---
@@ -269,171 +271,184 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   const lobeProperty = buildLobeProperty(currentLobeNames);
 
   return { tools: [
-    // memory_list_lobes is hidden — lobe info is surfaced in memory_context() hints
-    // and memory_stats. The handler still works if called directly.
+    // ─── New v2 tool surface ─────────────────────────────────────────────
+    // 4 retrieval tools + 4 storage tools + 1 maintenance tool.
+    // Old tools (memory_store, memory_query, memory_correct, memory_context) are hidden
+    // from listing but their handlers remain active for backward compatibility.
+
+    // --- Retrieval ---
     {
-      name: 'memory_store',
-      // Example comes first — agents form their call shape from the first concrete pattern they see.
-      // "entries" (not "content") signals a collection; fighting the "content = string" prior
-      // is an architectural fix rather than patching the description after the fact.
-      description: 'memory_store(topic: "gotchas", entries: [{title: "Build cache", fact: "Must clean build after Tuist changes"}, {title: "Tuist version", fact: "Project requires Tuist 4.x"}], tags: ["build"]). Stores enduring knowledge — (1) Codebase facts (architecture, conventions, gotchas, modules): what IS true now, not past actions. Wrong: "Completed migration to StateFlow." Right: "All ViewModels use StateFlow." (2) User knowledge (user, preferences): who the person is, how they work. "user" and "preferences" are stored in the alwaysInclude lobe (shared across projects). One insight per object; use multiple objects instead of bundling. If content looks likely-ephemeral, the tool returns a review-required response; re-run with durabilityDecision: "store-anyway" only when deliberate.',
+      name: 'brief',
+      description: 'Session start. Returns user identity, preferences, gotchas overview, stale entries. Call once at the beginning of a conversation. Example: brief(lobe: "android")',
       inputSchema: {
         type: 'object' as const,
         properties: {
           lobe: lobeProperty,
-          topic: {
-            type: 'string',
-            // modules/<name> is intentionally excluded from the enum so the MCP schema
-            // doesn't restrict it — agents can pass any "modules/foo" value and it works.
-            // The description makes this explicit.
-            description: 'Predefined: user | preferences | architecture | conventions | gotchas | recent-work. Custom namespace: modules/<name> (e.g. modules/brainstorm, modules/game-design, modules/api-notes). Use modules/<name> for any domain that doesn\'t fit the built-in topics.',
-            enum: ['user', 'preferences', 'architecture', 'conventions', 'gotchas', 'recent-work'],
-          },
-          entries: {
-            type: 'array',
-            // Type annotation first — agents trained on code read type signatures before prose.
-            description: 'Array<{title: string, fact: string}> — not a string. One object per insight. title: short label (2-5 words). fact: codebase topics → present-tense state ("X uses Y", not "Completed X"); user/preferences → what the person expressed. Wrong: one object bundling two facts. Right: two objects.',
-            items: {
-              type: 'object',
-              properties: {
-                title: {
-                  type: 'string',
-                  description: 'Short label for this insight (2-5 words)',
-                },
-                fact: {
-                  type: 'string',
-                  description: 'The insight itself — one focused fact or observation',
-                },
-              },
-              required: ['title', 'fact'],
-            },
-            minItems: 1,
-          },
-          sources: {
-            type: 'array',
-            items: { type: 'string' },
-            description: 'File paths that informed this (provenance, for freshness tracking)',
-            default: [],
-          },
-          references: {
-            type: 'array',
-            items: { type: 'string' },
-            description: 'Files, classes, or symbols this knowledge is about (semantic pointers). Example: ["features/messaging/impl/MessagingReducer.kt"]',
-            default: [],
-          },
-          trust: {
-            type: 'string',
-            enum: ['user', 'agent-confirmed', 'agent-inferred'],
-            description: 'user (from human) > agent-confirmed > agent-inferred',
-            default: 'agent-inferred',
-          },
-          tags: {
-            type: 'array',
-            items: { type: 'string' },
-            description: 'Category labels for exact-match retrieval (lowercase slugs). Query with filter: "#tag". Example: ["auth", "critical-path", "mite-combat"]',
-            default: [],
-          },
-          durabilityDecision: {
-            type: 'string',
-            enum: ['default', 'store-anyway'],
-            description: 'Write intent for content that may require review. Use "default" normally. Use "store-anyway" only when intentionally persisting content after a review-required response.',
-            default: 'default',
-          },
-        },
-        required: ['topic', 'entries'],
-      },
-    },
-    {
-      name: 'memory_query',
-      description: 'Search stored knowledge. Searches all lobes when lobe is omitted. Filter supports: keywords (stemmed), #tag (exact tag match), =term (exact keyword, no stemming), -term (NOT). Example: memory_query(scope: "*", filter: "#auth reducer", detail: "full")',
-      inputSchema: {
-        type: 'object' as const,
-        properties: {
-          lobe: lobeProperty,
-          scope: {
-            type: 'string',
-            description: 'Optional. Defaults to "*" (all topics). Options: * | user | preferences | architecture | conventions | gotchas | recent-work | modules/<name>',
-          },
-          detail: {
-            type: 'string',
-            enum: ['brief', 'standard', 'full'],
-            description: 'brief = titles only, standard = summaries, full = complete content + metadata',
-            default: 'brief',
-          },
-          filter: {
-            type: 'string',
-            description: 'Search terms. "A B" = AND, "A|B" = OR, "-A" = NOT, "#tag" = exact tag, "=term" = exact keyword (no stemming). Example: "#auth reducer -deprecated"',
-          },
-          branch: {
-            type: 'string',
-            description: 'Branch for recent-work. Omit = current branch, "*" = all branches.',
-          },
-          isFirstMemoryToolCall: {
-            type: 'boolean',
-            description: 'Set true on first memory call in a conversation to include identity/preferences from alwaysInclude lobes. Set false on subsequent calls to skip redundant global knowledge.',
-            default: true,
-          },
         },
         required: [],
       },
     },
-
     {
-      name: 'memory_correct',
-      description: 'Fix or delete an entry. Example: memory_correct(id: "arch-3f7a", action: "replace", correction: "updated content")',
-      inputSchema: {
-        type: 'object' as const,
-        properties: {
-          lobe: lobeProperty,
-          id: {
-            type: 'string',
-            description: 'Entry ID (e.g. arch-3f7a, pref-5c9b)',
-          },
-          correction: {
-            type: 'string',
-            description: 'New text (for append/replace). Not needed for delete.',
-          },
-          action: {
-            type: 'string',
-            enum: ['append', 'replace', 'delete'],
-            description: 'append | replace | delete',
-          },
-        },
-        required: ['id', 'action'],
-      },
-    },
-    {
-      name: 'memory_context',
-      description: 'Session start AND pre-task lookup. Call with no args at session start to get user identity, preferences, and stale entries. Call with context to get task-specific knowledge. When lobe is omitted, uses client workspace roots to select the matching lobe; falls back to global-only if roots are unavailable. Example: memory_context() or memory_context(context: "writing a Kotlin reducer")',
+      name: 'recall',
+      description: 'Pre-task lookup. Describe what you are about to do and get relevant knowledge (semantic + keyword search). Example: recall(lobe: "android", context: "writing a Kotlin reducer for the messaging feature")',
       inputSchema: {
         type: 'object' as const,
         properties: {
           lobe: lobeProperty,
           context: {
             type: 'string',
-            description: 'Optional. What you are about to do, in natural language. Omit for session-start briefing (user + preferences + stale entries).',
+            description: 'What you are about to do, in natural language.',
           },
           maxResults: {
             type: 'number',
             description: 'Max results (default: 10)',
             default: 10,
           },
-          minMatch: {
-            type: 'number',
-            description: 'Min keyword match ratio 0-1 (default: 0.2). Higher = stricter.',
-            default: 0.2,
-          },
-          isFirstMemoryToolCall: {
-            type: 'boolean',
-            description: 'Set true on first memory call in a conversation to include identity/preferences from alwaysInclude lobes. Set false on subsequent calls to skip redundant global knowledge.',
-            default: true,
+        },
+        required: ['context'],
+      },
+    },
+    {
+      name: 'gotchas',
+      description: 'Get stored gotchas for a codebase area. Example: gotchas(lobe: "android", area: "auth")',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          lobe: lobeProperty,
+          area: {
+            type: 'string',
+            description: 'Optional keyword filter for a specific area (e.g. "auth", "build", "navigation").',
           },
         },
         required: [],
       },
     },
-    // memory_stats is hidden — agents rarely need it proactively. Mentioned in
-    // hints when storage is running low. The handler still works if called directly.
+    {
+      name: 'conventions',
+      description: 'Get stored conventions for a codebase area. Example: conventions(lobe: "android", area: "testing")',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          lobe: lobeProperty,
+          area: {
+            type: 'string',
+            description: 'Optional keyword filter for a specific area (e.g. "testing", "naming", "architecture").',
+          },
+        },
+        required: [],
+      },
+    },
+
+    // --- Storage ---
+    {
+      name: 'gotcha',
+      description: 'Store a gotcha — a pitfall, surprising behavior, or trap. Write naturally; title is auto-extracted. Example: gotcha(lobe: "android", observation: "Gradle cache must be cleaned after Tuist changes or builds silently use stale artifacts")',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          lobe: lobeProperty,
+          observation: {
+            type: 'string',
+            description: 'The gotcha — write naturally. First sentence becomes the title.',
+          },
+          durabilityDecision: {
+            type: 'string',
+            enum: ['default', 'store-anyway'],
+            description: 'Use "store-anyway" only when re-storing after a review-required response.',
+            default: 'default',
+          },
+        },
+        required: ['lobe', 'observation'],
+      },
+    },
+    {
+      name: 'convention',
+      description: 'Store a convention — a pattern, rule, or standard the codebase follows. Example: convention(lobe: "android", observation: "All ViewModels use StateFlow for UI state. LiveData is banned.")',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          lobe: lobeProperty,
+          observation: {
+            type: 'string',
+            description: 'The convention — write naturally. First sentence becomes the title.',
+          },
+          durabilityDecision: {
+            type: 'string',
+            enum: ['default', 'store-anyway'],
+            description: 'Use "store-anyway" only when re-storing after a review-required response.',
+            default: 'default',
+          },
+        },
+        required: ['lobe', 'observation'],
+      },
+    },
+    {
+      name: 'learn',
+      description: 'Store a general observation — architecture decisions, dependency info, or any insight. Example: learn(lobe: "android", observation: "The messaging feature uses MVVM with a FlowCoordinator for navigation state")',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          lobe: lobeProperty,
+          observation: {
+            type: 'string',
+            description: 'The observation — write naturally. First sentence becomes the title.',
+          },
+          durabilityDecision: {
+            type: 'string',
+            enum: ['default', 'store-anyway'],
+            description: 'Use "store-anyway" only when re-storing after a review-required response.',
+            default: 'default',
+          },
+        },
+        required: ['lobe', 'observation'],
+      },
+    },
+    {
+      name: 'prefer',
+      description: 'Store a user preference or working style rule. Stored with high trust. Example: prefer(rule: "Always suggest the simplest solution first")',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          rule: {
+            type: 'string',
+            description: 'The preference or rule — write naturally.',
+          },
+          lobe: {
+            ...lobeProperty,
+            description: `Optional. Lobe to scope this preference to. Omit for global preferences. Available: ${currentLobeNames.join(', ')}`,
+          },
+        },
+        required: ['rule'],
+      },
+    },
+
+    // --- Maintenance ---
+    {
+      name: 'fix',
+      description: 'Fix or delete an entry. With correction: replaces content. Without: deletes. Example: fix(id: "gotcha-3f7a", correction: "updated text") or fix(id: "gotcha-3f7a")',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          id: {
+            type: 'string',
+            description: 'Entry ID (e.g. gotcha-3f7a, arch-5c9b).',
+          },
+          correction: {
+            type: 'string',
+            description: 'New text. Omit to delete the entry.',
+          },
+          lobe: {
+            ...lobeProperty,
+            description: `Optional. Searches all lobes if omitted. Available: ${currentLobeNames.join(', ')}`,
+          },
+        },
+        required: ['id'],
+      },
+    },
+
+    // --- Legacy tools (still listed for backward compatibility) ---
+    // memory_store, memory_query, memory_correct, memory_context handlers remain active
+    // but are hidden from tool discovery. Agents use the new v2 tools above.
     {
       name: 'memory_bootstrap',
       description: 'First-time setup: scan repo structure, README, and build system to seed initial knowledge. Run once per new codebase. If the lobe does not exist yet, provide "root" to auto-add it to memory-config.json and proceed without a manual restart.',
@@ -442,7 +457,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         properties: {
           lobe: {
             type: 'string' as const,
-            // No enum restriction: agents pass new lobe names not yet in the config
             description: `Memory lobe name. If the lobe doesn't exist yet, also pass "root" to auto-create it. Available lobes: ${currentLobeNames.join(', ')}`,
           },
           root: {
@@ -457,12 +471,39 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         required: [],
       },
     },
-    // memory_diagnose is intentionally hidden from the tool list — it clutters
-    // agent tool discovery and should only be called when directed by error messages
-    // or crash reports. The handler still works if called directly.
-    // memory_reembed is hidden — utility for generating/regenerating embeddings.
-    // Surfaced via hint in memory_context when >50% of entries lack vectors.
+    // Hidden tools — handlers still active:
+    // memory_stats, memory_diagnose, memory_reembed, memory_list_lobes,
+    // memory_store, memory_query, memory_correct, memory_context
   ] };
+});
+
+// --- MCP Resource: memory://lobes ---
+server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  await configManager.ensureFresh();
+  return {
+    resources: [{
+      uri: 'memory://lobes',
+      name: 'Available memory lobes',
+      description: 'Lists all configured memory lobes with their health status and entry counts.',
+      mimeType: 'application/json',
+    }],
+  };
+});
+
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  const uri = request.params.uri;
+  if (uri === 'memory://lobes') {
+    await configManager.ensureFresh();
+    const lobeInfo = await buildLobeInfo();
+    return {
+      contents: [{
+        uri: 'memory://lobes',
+        mimeType: 'application/json',
+        text: JSON.stringify({ lobes: lobeInfo }, null, 2),
+      }],
+    };
+  }
+  throw new Error(`Unknown resource: ${uri}`);
 });
 
 // --- Tool handlers ---
@@ -517,6 +558,380 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      // ─── New v2 tool handlers ────────────────────────────────────────────
+
+      // Shared helper for gotcha/convention/learn — identical store logic, different topic.
+      case 'gotcha':
+      case 'convention':
+      case 'learn': {
+        const topicMap: Record<string, import('./types.js').TopicScope> = {
+          gotcha: 'gotchas', convention: 'conventions', learn: 'general',
+        };
+        const topic = topicMap[name];
+        const { lobe: rawLobe, observation, durabilityDecision } = z.object({
+          lobe: z.string().min(1),
+          observation: z.string().min(1),
+          durabilityDecision: z.enum(['default', 'store-anyway']).default('default'),
+        }).parse(args);
+
+        process.stderr.write(`[memory-mcp] tool=${name} lobe=${rawLobe}\n`);
+
+        const ctx = resolveToolContext(rawLobe);
+        if (!ctx.ok) return contextError(ctx);
+
+        const { title, content } = extractTitle(observation);
+        const result = await ctx.store.store(topic, title, content, [], 'agent-inferred', [], [], durabilityDecision);
+
+        if (result.kind === 'review-required') {
+          return {
+            content: [{ type: 'text', text: `[${ctx.label}] Review required: ${result.warning}\n\nIf intentional, re-run: ${name}(lobe: "${rawLobe}", observation: "...", durabilityDecision: "store-anyway")` }],
+            isError: true,
+          };
+        }
+        if (result.kind === 'rejected') {
+          return {
+            content: [{ type: 'text', text: `[${ctx.label}] Failed: ${result.warning}` }],
+            isError: true,
+          };
+        }
+
+        const lootDrop = result.relatedEntries ? formatLootDrop(result.relatedEntries) : '';
+        const label = name === 'learn' ? '' : `${name} `;
+        return {
+          content: [{ type: 'text', text: `[${ctx.label}] Stored ${label}${result.id}: "${title}" (confidence: ${result.confidence})${lootDrop}` }],
+        };
+      }
+
+      case 'brief': {
+        // Session-start briefing — user identity, preferences, gotchas overview, stale entries.
+        // Delegates to the same briefing logic as memory_context(context: undefined).
+        const { lobe: rawLobe } = z.object({
+          lobe: z.string().optional(),
+        }).parse(args ?? {});
+
+        process.stderr.write(`[memory-mcp] tool=brief lobe=${rawLobe ?? 'auto'}\n`);
+
+        // Surface previous crash report
+        const previousCrash = await readLatestCrash();
+        const crashSection = previousCrash
+          ? `## Previous Crash Detected\n${formatCrashSummary(previousCrash)}\nRun **memory_diagnose** for full details.\n`
+          : '';
+        if (previousCrash) await clearLatestCrash();
+
+        // Surface degraded lobes warning
+        const allBriefingLobes = rawLobe
+          ? [rawLobe, ...configManager.getAlwaysIncludeLobes().filter(n => n !== rawLobe)]
+          : configManager.getLobeNames();
+        const degradedLobeNames = allBriefingLobes.filter(n => configManager.getLobeHealth(n)?.status === 'degraded');
+        const degradedSection = degradedLobeNames.length > 0
+          ? `## Degraded Lobes: ${degradedLobeNames.join(', ')}\nRun **memory_diagnose** for details.`
+          : '';
+
+        const sections: string[] = [];
+        if (crashSection) sections.push(crashSection);
+        if (degradedSection) sections.push(degradedSection);
+
+        // Collect briefing across all lobes (or specified lobe + alwaysInclude)
+        const briefingLobeNames = allBriefingLobes;
+        const allStale: import('./types.js').StaleEntry[] = [];
+        let totalEntries = 0;
+        const alwaysIncludeSet = new Set(configManager.getAlwaysIncludeLobes());
+
+        for (const lobeName of briefingLobeNames) {
+          const health = configManager.getLobeHealth(lobeName);
+          if (health?.status === 'degraded') continue;
+          const store = configManager.getStore(lobeName);
+          if (!store) continue;
+          const budget = alwaysIncludeSet.has(lobeName) ? 300 : 100;
+          const lobeBriefing = await store.briefing(budget);
+          if (lobeBriefing.entryCount > 0) sections.push(lobeBriefing.briefing);
+          if (lobeBriefing.staleDetails) allStale.push(...lobeBriefing.staleDetails);
+          totalEntries += lobeBriefing.entryCount;
+        }
+
+        if (allStale.length > 0) sections.push(formatStaleSection(allStale));
+
+        if (sections.length === 0) {
+          sections.push('No knowledge stored yet. As you work, use **gotcha**, **convention**, or **learn** to store observations. Try **memory_bootstrap** to seed initial knowledge.');
+        }
+
+        const briefLobes = briefingLobeNames.filter(n => configManager.getLobeHealth(n)?.status !== 'degraded');
+        sections.push(`---\n*${totalEntries} entries across ${briefLobes.length} ${briefLobes.length === 1 ? 'lobe' : 'lobes'}. Use **recall(context: "what you are doing")** for task-specific knowledge.*`);
+
+        return { content: [{ type: 'text', text: sections.join('\n\n---\n\n') }] };
+      }
+
+      case 'recall': {
+        // Pre-task lookup — semantic + keyword search on the target lobe.
+        // Pure task-relevant search — no global preferences (that's what brief is for).
+        const { lobe: rawLobe, context, maxResults } = z.object({
+          lobe: z.string().optional(),
+          context: z.string().min(1),
+          maxResults: z.number().optional(),
+        }).parse(args);
+
+        process.stderr.write(`[memory-mcp] tool=recall lobe=${rawLobe ?? 'auto'} context="${context.slice(0, 50)}"\n`);
+
+        const max = maxResults ?? 10;
+        const allLobeResults: ScoredEntry[] = [];
+        const ctxEntryLobeMap = new Map<string, string>();
+        let label: string;
+        let primaryStore: MarkdownMemoryStore | undefined;
+
+        if (rawLobe) {
+          const ctx = resolveToolContext(rawLobe);
+          if (!ctx.ok) return contextError(ctx);
+          label = ctx.label;
+          primaryStore = ctx.store;
+          const lobeResults = await ctx.store.contextSearch(context, max);
+          allLobeResults.push(...lobeResults);
+        } else {
+          // Search all non-global lobes (recall is task-specific, not identity)
+          const resolution = await resolveLobesForRead(false);
+          switch (resolution.kind) {
+            case 'resolved': {
+              label = resolution.label;
+              for (const lobeName of resolution.lobes) {
+                const store = configManager.getStore(lobeName);
+                if (!store) continue;
+                if (!primaryStore) primaryStore = store;
+                const lobeResults = await store.contextSearch(context, max);
+                if (resolution.lobes.length > 1) {
+                  for (const r of lobeResults) ctxEntryLobeMap.set(r.entry.id, lobeName);
+                }
+                allLobeResults.push(...lobeResults);
+              }
+              break;
+            }
+            case 'global-only': {
+              // No project lobes matched — ask agent to specify
+              return {
+                content: [{ type: 'text', text: `Cannot determine which lobe to search. Specify the lobe: recall(lobe: "...", context: "${context}")\nAvailable: ${configManager.getLobeNames().join(', ')}` }],
+                isError: true,
+              };
+            }
+          }
+        }
+
+        // Dedupe, sort, slice
+        const seenIds = new Set<string>();
+        const results = allLobeResults
+          .sort((a, b) => b.score - a.score)
+          .filter(r => {
+            if (seenIds.has(r.entry.id)) return false;
+            seenIds.add(r.entry.id);
+            return true;
+          })
+          .slice(0, max);
+
+        if (results.length === 0) {
+          const modeHint = primaryStore
+            ? `\n${formatSearchMode(primaryStore.hasEmbedder, primaryStore.vectorCount, primaryStore.entryCount)}`
+            : '';
+          return {
+            content: [{
+              type: 'text',
+              text: `No relevant knowledge found for: "${context}"\n\nProceed without prior context. Use **gotcha**, **convention**, or **learn** to store observations as you work.${modeHint}`,
+            }],
+          };
+        }
+
+        // Format results grouped by topic
+        const sections: string[] = [`## Recall: "${context}"\n`];
+        const byTopic = new Map<string, typeof results>();
+        for (const r of results) {
+          const list = byTopic.get(r.entry.topic) ?? [];
+          list.push(r);
+          byTopic.set(r.entry.topic, list);
+        }
+
+        const topicOrder = ['gotchas', 'conventions', 'architecture', 'general'];
+        const orderedTopics = [
+          ...topicOrder.filter(t => byTopic.has(t)),
+          ...Array.from(byTopic.keys()).filter(t => !topicOrder.includes(t)).sort(),
+        ];
+
+        const showLobeLabels = ctxEntryLobeMap.size > 0;
+        for (const topic of orderedTopics) {
+          const topicResults = byTopic.get(topic)!;
+          const heading = topic === 'gotchas' ? 'Gotchas'
+            : topic === 'conventions' ? 'Conventions'
+            : topic === 'general' ? 'General'
+            : topic.startsWith('modules/') ? `Module: ${topic.split('/')[1]}`
+            : topic.charAt(0).toUpperCase() + topic.slice(1);
+
+          sections.push(`### ${heading}`);
+          for (const r of topicResults) {
+            const marker = topic === 'gotchas' ? '[!] ' : '';
+            const lobeLabel = showLobeLabels ? ` [${ctxEntryLobeMap.get(r.entry.id) ?? '?'}]` : '';
+            sections.push(`- **${marker}${r.entry.title}**${lobeLabel}: ${r.entry.content}`);
+          }
+          sections.push('');
+        }
+
+        // Mode indicator
+        if (primaryStore) {
+          sections.push(formatSearchMode(primaryStore.hasEmbedder, primaryStore.vectorCount, primaryStore.entryCount));
+        }
+
+        return { content: [{ type: 'text', text: sections.join('\n') }] };
+      }
+
+      case 'gotchas': {
+        // Topic-filtered query for gotchas.
+        const { lobe: rawLobe, area } = z.object({
+          lobe: z.string().optional(),
+          area: z.string().optional(),
+        }).parse(args ?? {});
+
+        process.stderr.write(`[memory-mcp] tool=gotchas lobe=${rawLobe ?? 'auto'} area=${area ?? '*'}\n`);
+
+        const ctx = resolveToolContext(rawLobe);
+        if (!ctx.ok) return contextError(ctx);
+
+        const result = await ctx.store.query('gotchas', 'standard', area);
+        if (result.entries.length === 0) {
+          return {
+            content: [{ type: 'text', text: `[${ctx.label}] No gotchas found${area ? ` for "${area}"` : ''}. Use **gotcha(lobe, observation)** to store one.` }],
+          };
+        }
+
+        const lines = result.entries.map(e =>
+          `- **[!] ${e.title}** (${e.id}): ${e.content}`
+        );
+        return {
+          content: [{ type: 'text', text: `## [${ctx.label}] Gotchas${area ? ` — ${area}` : ''}\n\n${lines.join('\n')}` }],
+        };
+      }
+
+      case 'conventions': {
+        // Topic-filtered query for conventions.
+        const { lobe: rawLobe, area } = z.object({
+          lobe: z.string().optional(),
+          area: z.string().optional(),
+        }).parse(args ?? {});
+
+        process.stderr.write(`[memory-mcp] tool=conventions lobe=${rawLobe ?? 'auto'} area=${area ?? '*'}\n`);
+
+        const ctx = resolveToolContext(rawLobe);
+        if (!ctx.ok) return contextError(ctx);
+
+        const result = await ctx.store.query('conventions', 'standard', area);
+        if (result.entries.length === 0) {
+          return {
+            content: [{ type: 'text', text: `[${ctx.label}] No conventions found${area ? ` for "${area}"` : ''}. Use **convention(lobe, observation)** to store one.` }],
+          };
+        }
+
+        const lines = result.entries.map(e =>
+          `- **${e.title}** (${e.id}): ${e.content}`
+        );
+        return {
+          content: [{ type: 'text', text: `## [${ctx.label}] Conventions${area ? ` — ${area}` : ''}\n\n${lines.join('\n')}` }],
+        };
+      }
+
+      case 'prefer': {
+        // Store a user preference. Routes to alwaysInclude lobe (or specified lobe).
+        const { rule, lobe: rawLobe } = z.object({
+          rule: z.string().min(1),
+          lobe: z.string().optional(),
+        }).parse(args);
+
+        process.stderr.write(`[memory-mcp] tool=prefer lobe=${rawLobe ?? 'global'}\n`);
+
+        // Route to alwaysInclude lobe when no lobe specified
+        let effectiveLobe = rawLobe;
+        if (!effectiveLobe) {
+          const alwaysIncludeLobes = configManager.getAlwaysIncludeLobes();
+          effectiveLobe = alwaysIncludeLobes.length > 0 ? alwaysIncludeLobes[0] : undefined;
+        }
+
+        const ctx = resolveToolContext(effectiveLobe);
+        if (!ctx.ok) {
+          return {
+            content: [{ type: 'text', text: `No global lobe configured for preferences. Specify a lobe: prefer(rule: "...", lobe: "...").\nAvailable: ${configManager.getLobeNames().join(', ')}` }],
+            isError: true,
+          };
+        }
+
+        const { title, content } = extractTitle(rule);
+        const result = await ctx.store.store('preferences', title, content, [], 'user');
+
+        if (result.kind !== 'stored') {
+          return {
+            content: [{ type: 'text', text: `[${ctx.label}] Failed to store preference: ${result.kind === 'review-required' ? result.warning : result.kind === 'rejected' ? result.warning : 'unknown error'}` }],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [{ type: 'text', text: `[${ctx.label}] Stored preference ${result.id}: "${title}" (trust: user)` }],
+        };
+      }
+
+      case 'fix': {
+        // Fix or delete an entry. Search all stores if no lobe specified.
+        const { id, correction, lobe: rawLobe } = z.object({
+          id: z.string().min(1),
+          correction: z.string().optional(),
+          lobe: z.string().optional(),
+        }).parse(args);
+
+        process.stderr.write(`[memory-mcp] tool=fix id=${id} action=${correction ? 'replace' : 'delete'}\n`);
+
+        const action = correction !== undefined && correction.length > 0 ? 'replace' : 'delete';
+
+        // Resolve lobe — search all stores if not specified
+        let effectiveFixLobe = rawLobe;
+        let foundInLobe: string | undefined;
+        if (!effectiveFixLobe) {
+          for (const lobeName of configManager.getLobeNames()) {
+            const store = configManager.getStore(lobeName);
+            if (!store) continue;
+            try {
+              if (await store.hasEntry(id)) {
+                effectiveFixLobe = lobeName;
+                foundInLobe = lobeName;
+                break;
+              }
+            } catch {
+              // Skip degraded lobes
+            }
+          }
+        }
+
+        if (!effectiveFixLobe) {
+          return {
+            content: [{ type: 'text', text: `Entry "${id}" not found in any lobe. Available: ${configManager.getLobeNames().join(', ')}` }],
+            isError: true,
+          };
+        }
+
+        const ctx = resolveToolContext(effectiveFixLobe);
+        if (!ctx.ok) return contextError(ctx);
+
+        const result = await ctx.store.correct(id, correction ?? '', action);
+        if (!result.corrected) {
+          return {
+            content: [{ type: 'text', text: `[${ctx.label}] Failed: ${result.error}` }],
+            isError: true,
+          };
+        }
+
+        const lobeNote = foundInLobe && !rawLobe ? ` (found in lobe: ${foundInLobe})` : '';
+        if (action === 'delete') {
+          return {
+            content: [{ type: 'text', text: `Deleted entry ${id}${lobeNote}.` }],
+          };
+        }
+        return {
+          content: [{ type: 'text', text: `Fixed entry ${id}${lobeNote} (confidence: ${result.newConfidence}, trust: ${result.trust}).` }],
+        };
+      }
+
+      // ─── Legacy tool handlers (hidden from listing) ──────────────────────
+
       case 'memory_store': {
         const { lobe: rawLobe, topic: rawTopic, entries: rawEntries, sources, references, trust: rawTrust, tags: rawTags, durabilityDecision } = z.object({
           lobe: z.string().optional(),
@@ -542,7 +957,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const topic = parseTopicScope(rawTopic);
         if (!topic) {
           return {
-            content: [{ type: 'text', text: `Invalid topic: "${rawTopic}". Valid: user | preferences | architecture | conventions | gotchas | recent-work | modules/<name>` }],
+            content: [{ type: 'text', text: `Invalid topic: "${rawTopic}". Valid: user | preferences | architecture | conventions | gotchas | general | recent-work | modules/<name>` }],
             isError: true,
           };
         }

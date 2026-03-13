@@ -244,18 +244,26 @@ describe('E2E: MCP Server', () => {
       assert.ok(Array.isArray(tools), 'Should return an array of tools');
 
       const toolNames = tools.map(t => t.name);
-      // 5 visible tools
-      assert.ok(toolNames.includes('memory_store'), 'Should have memory_store');
-      assert.ok(toolNames.includes('memory_query'), 'Should have memory_query');
-      assert.ok(toolNames.includes('memory_correct'), 'Should have memory_correct');
-      assert.ok(toolNames.includes('memory_context'), 'Should have memory_context');
+      // 10 visible tools: 4 retrieval + 4 storage + 1 maintenance + 1 legacy (bootstrap)
+      assert.ok(toolNames.includes('brief'), 'Should have brief');
+      assert.ok(toolNames.includes('recall'), 'Should have recall');
+      assert.ok(toolNames.includes('gotchas'), 'Should have gotchas');
+      assert.ok(toolNames.includes('conventions'), 'Should have conventions');
+      assert.ok(toolNames.includes('gotcha'), 'Should have gotcha');
+      assert.ok(toolNames.includes('convention'), 'Should have convention');
+      assert.ok(toolNames.includes('learn'), 'Should have learn');
+      assert.ok(toolNames.includes('prefer'), 'Should have prefer');
+      assert.ok(toolNames.includes('fix'), 'Should have fix');
       assert.ok(toolNames.includes('memory_bootstrap'), 'Should have memory_bootstrap');
-      // Hidden tools — still callable but not in the catalog
-      assert.ok(!toolNames.includes('memory_briefing'), 'Should NOT have memory_briefing (replaced by memory_context)');
-      assert.ok(!toolNames.includes('memory_diagnose'), 'Should NOT list memory_diagnose (hidden)');
-      assert.ok(!toolNames.includes('memory_stats'), 'Should NOT list memory_stats (hidden)');
-      assert.ok(!toolNames.includes('memory_list_lobes'), 'Should NOT list memory_list_lobes (hidden)');
-      assert.strictEqual(toolNames.length, 5, 'Should have exactly 5 visible tools');
+      // Old tools are hidden but handlers remain active
+      assert.ok(!toolNames.includes('memory_store'), 'memory_store should be hidden');
+      assert.ok(!toolNames.includes('memory_query'), 'memory_query should be hidden');
+      assert.ok(!toolNames.includes('memory_correct'), 'memory_correct should be hidden');
+      assert.ok(!toolNames.includes('memory_context'), 'memory_context should be hidden');
+      assert.ok(!toolNames.includes('memory_diagnose'), 'memory_diagnose should be hidden');
+      assert.ok(!toolNames.includes('memory_stats'), 'memory_stats should be hidden');
+      assert.ok(!toolNames.includes('memory_list_lobes'), 'memory_list_lobes should be hidden');
+      assert.strictEqual(toolNames.length, 10, 'Should have exactly 10 visible tools');
     });
   });
 
