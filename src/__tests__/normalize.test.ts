@@ -167,4 +167,69 @@ describe('normalizeArgs', () => {
       assert.strictEqual(result['lobe'], 'my-repo');
     });
   });
+
+  describe('v2 tool-specific aliases', () => {
+    it('resolves "query" to "context" for recall', () => {
+      const result = normalizeArgs('recall', { query: 'auth flow' }, singleLobe);
+      assert.strictEqual(result['context'], 'auth flow');
+      assert.strictEqual(result['query'], undefined);
+    });
+
+    it('resolves "search" to "context" for recall', () => {
+      const result = normalizeArgs('recall', { search: 'kotlin coroutines' }, singleLobe);
+      assert.strictEqual(result['context'], 'kotlin coroutines');
+    });
+
+    it('resolves "description" to "context" for recall', () => {
+      const result = normalizeArgs('recall', { description: 'working on auth' }, singleLobe);
+      assert.strictEqual(result['context'], 'working on auth');
+    });
+
+    it('does not overwrite existing "context" with alias', () => {
+      const result = normalizeArgs('recall', { context: 'real', query: 'alias' }, singleLobe);
+      assert.strictEqual(result['context'], 'real');
+    });
+
+    it('resolves "query" to "filter" for memory_query (not context)', () => {
+      const result = normalizeArgs('memory_query', { query: 'MVI' }, singleLobe);
+      assert.strictEqual(result['filter'], 'MVI');
+      assert.strictEqual(result['context'], undefined);
+    });
+
+    it('resolves "content" to "observation" for gotcha', () => {
+      const result = normalizeArgs('gotcha', { lobe: 'x', content: 'some gotcha' }, singleLobe);
+      assert.strictEqual(result['observation'], 'some gotcha');
+      assert.strictEqual(result['content'], undefined);
+    });
+
+    it('resolves "note" to "observation" for convention', () => {
+      const result = normalizeArgs('convention', { lobe: 'x', note: 'some convention' }, singleLobe);
+      assert.strictEqual(result['observation'], 'some convention');
+    });
+
+    it('resolves "fact" to "observation" for learn', () => {
+      const result = normalizeArgs('learn', { lobe: 'x', fact: 'some info' }, singleLobe);
+      assert.strictEqual(result['observation'], 'some info');
+    });
+
+    it('resolves "preference" to "rule" for prefer', () => {
+      const result = normalizeArgs('prefer', { preference: 'be concise' }, singleLobe);
+      assert.strictEqual(result['rule'], 'be concise');
+    });
+
+    it('resolves "text" to "correction" for fix', () => {
+      const result = normalizeArgs('fix', { id: 'x', text: 'new content' }, singleLobe);
+      assert.strictEqual(result['correction'], 'new content');
+    });
+
+    it('resolves "query" to "area" for gotchas', () => {
+      const result = normalizeArgs('gotchas', { query: 'auth' }, singleLobe);
+      assert.strictEqual(result['area'], 'auth');
+    });
+
+    it('resolves "filter" to "area" for conventions', () => {
+      const result = normalizeArgs('conventions', { filter: 'testing' }, singleLobe);
+      assert.strictEqual(result['area'], 'testing');
+    });
+  });
 });

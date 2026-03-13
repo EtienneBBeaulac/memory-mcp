@@ -4,17 +4,10 @@
 // and applies defaults to avoid wasted round-trips from validation errors.
 // Pure functions — no side effects, no state.
 
-/** Canonical param name aliases — maps guessed names to their correct form */
-const PARAM_ALIASES: Record<string, string> = {
+/** Global param aliases — apply to all tools regardless of name */
+const GLOBAL_ALIASES: Record<string, string> = {
   // memory_store aliases
   refs: 'references',
-  // memory_query aliases
-  query: 'filter',
-  search: 'filter',
-  keyword: 'filter',
-  // memory_context aliases
-  description: 'context',
-  task: 'context',
   // tag aliases
   tag: 'tags',
   labels: 'tags',
@@ -22,6 +15,29 @@ const PARAM_ALIASES: Record<string, string> = {
   // lobe aliases
   workspace: 'lobe',
   repo: 'lobe',
+};
+
+/** Tool-specific param aliases — only apply when the tool name matches.
+ *  Prevents `query` → `filter` rewriting from breaking `recall(query: "...")`. */
+const TOOL_ALIASES: Record<string, Record<string, string>> = {
+  // Legacy tools: "query" means "filter"
+  memory_query: { query: 'filter', search: 'filter', keyword: 'filter' },
+  memory_store: { scope: 'topic' },
+  // Legacy tools: "description"/"task" mean "context"
+  memory_context: { description: 'context', task: 'context' },
+  // v2 retrieval tools: "query"/"search"/"description"/"task" mean "context"
+  recall: { query: 'context', search: 'context', description: 'context', task: 'context' },
+  // v2 storage tools: "content"/"note"/"fact" mean "observation"
+  gotcha: { content: 'observation', note: 'observation', fact: 'observation', message: 'observation' },
+  convention: { content: 'observation', note: 'observation', fact: 'observation', message: 'observation' },
+  learn: { content: 'observation', note: 'observation', fact: 'observation', message: 'observation' },
+  // v2 prefer: "preference"/"pref" mean "rule"
+  prefer: { preference: 'rule', pref: 'rule' },
+  // v2 fix: "text"/"content"/"replacement" mean "correction"
+  fix: { text: 'correction', content: 'correction', replacement: 'correction' },
+  // v2 retrieval: "filter"/"keyword" mean "area"
+  gotchas: { filter: 'area', keyword: 'area', query: 'area', search: 'area' },
+  conventions: { filter: 'area', keyword: 'area', query: 'area', search: 'area' },
 };
 
 /** Wildcard scope aliases — agents guess many variations instead of "*" */
@@ -38,18 +54,23 @@ export function normalizeArgs(
 ): Record<string, unknown> {
   const args: Record<string, unknown> = { ...(raw ?? {}) };
 
-  // 1. Resolve param aliases (move aliased keys to canonical names)
-  for (const [alias, canonical] of Object.entries(PARAM_ALIASES)) {
+  // 1. Resolve global param aliases
+  for (const [alias, canonical] of Object.entries(GLOBAL_ALIASES)) {
     if (alias in args && !(canonical in args)) {
       args[canonical] = args[alias];
       delete args[alias];
     }
   }
 
-  // 2. For memory_store: accept "scope" as alias for "topic"
-  if (toolName === 'memory_store' && 'scope' in args && !('topic' in args)) {
-    args['topic'] = args['scope'];
-    delete args['scope'];
+  // 2. Resolve tool-specific param aliases
+  const toolSpecific = TOOL_ALIASES[toolName];
+  if (toolSpecific) {
+    for (const [alias, canonical] of Object.entries(toolSpecific)) {
+      if (alias in args && !(canonical in args)) {
+        args[canonical] = args[alias];
+        delete args[alias];
+      }
+    }
   }
 
   // 3. Default lobe to the only available one when omitted
