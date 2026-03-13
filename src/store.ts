@@ -22,9 +22,7 @@ import {
   CONFLICT_MIN_CONTENT_CHARS,
   OPPOSITION_PAIRS,
   PREFERENCE_SURFACE_THRESHOLD,
-  REFERENCE_BOOST_MULTIPLIER,
   TOPIC_BOOST,
-  MODULE_TOPIC_BOOST,
   USER_ALWAYS_INCLUDE_SCORE_FRACTION,
   DEFAULT_STALE_DAYS_STANDARD,
   DEFAULT_STALE_DAYS_PREFERENCES,
@@ -32,12 +30,13 @@ import {
   DEFAULT_MAX_DEDUP_SUGGESTIONS,
   DEFAULT_MAX_CONFLICT_PAIRS,
   DEFAULT_MAX_PREFERENCE_SUGGESTIONS,
-  TAG_MATCH_BOOST,
 } from './thresholds.js';
 import { realGitService } from './git-service.js';
 import {
-  extractKeywords, stem, similarity, matchesFilter, computeRelevanceScore,
+  extractKeywords, similarity, matchesFilter, computeRelevanceScore,
 } from './text-analyzer.js';
+import { keywordRank } from './ranking.js';
+import type { ScoredEntry, RankContext } from './ranking.js';
 import { detectEphemeralSignals, formatEphemeralWarning, getEphemeralSeverity } from './ephemeral.js';
 
 // Used only by bootstrap() for git log — not part of the GitService boundary
@@ -551,13 +550,14 @@ export class MarkdownMemoryStore {
   // --- Contextual search (memory_context) ---
 
   /** Search across all topics using keyword matching with topic-based boosting.
+   *  Orchestrator: reload, extract keywords, delegate to keywordRank, apply policies.
    *  @param minMatch Minimum ratio of context keywords that must match (0-1, default 0.2) */
   async contextSearch(
     context: string,
     maxResults: number = 10,
     branchFilter?: string,
     minMatch: number = 0.2,
-  ): Promise<Array<{ entry: MemoryEntry; score: number; matchedKeywords: string[] }>> {
+  ): Promise<readonly ScoredEntry[]> {
     // Reload from disk to pick up changes from other processes
     await this.reloadFromDisk();
 
@@ -565,61 +565,32 @@ export class MarkdownMemoryStore {
     if (contextKeywords.size === 0) return [];
 
     const currentBranch = branchFilter || await this.getCurrentBranch();
+    const allEntries = Array.from(this.entries.values());
 
-    // Topic boost factors — higher = more likely to surface
-    const topicBoost = TOPIC_BOOST;
-
-    const results: Array<{ entry: MemoryEntry; score: number; matchedKeywords: string[] }> = [];
-
-    for (const entry of this.entries.values()) {
-      // Filter recent-work by branch (unless branchFilter is "*")
-      if (entry.topic === 'recent-work' && branchFilter !== '*' && entry.branch && entry.branch !== currentBranch) {
-        continue;
-      }
-
-      // Include tag values as keywords so tagged entries surface in context search
-      const tagKeywordPart = entry.tags ? ` ${entry.tags.join(' ')}` : '';
-      const entryKeywords = extractKeywords(`${entry.title} ${entry.content}${tagKeywordPart}`);
-      const matchedKeywords: string[] = [];
-
-      for (const kw of contextKeywords) {
-        if (entryKeywords.has(kw)) matchedKeywords.push(kw);
-      }
-
-      if (matchedKeywords.length === 0) continue;
-
-      // Enforce minimum match threshold
-      const matchRatio = matchedKeywords.length / contextKeywords.size;
-      if (matchRatio < minMatch) continue;
-
-      // Score = keyword match ratio x confidence x topic boost x reference boost
-      const boost = topicBoost[entry.topic] ?? (entry.topic.startsWith('modules/') ? MODULE_TOPIC_BOOST : 1.0);
-      const freshnessMultiplier = this.isFresh(entry) ? 1.0 : 0.7;
-
-      // Reference boost: exact class/file name match in references gets a 1.3x multiplier.
-      // Extracts the basename (without extension) from each reference path and stems it,
-      // then checks for overlap with the context keywords.
-      const referenceBoost = entry.references?.some(ref => {
-        const basename = ref.split('/').pop()?.replace(/\.\w+$/, '') ?? ref;
-        return contextKeywords.has(stem(basename.toLowerCase()));
-      }) ? REFERENCE_BOOST_MULTIPLIER : 1.0;
-
-      // Tag boost: if any tag exactly matches a context keyword, boost the entry
-      const tagBoost = entry.tags?.some(tag => contextKeywords.has(tag))
-        ? TAG_MATCH_BOOST : 1.0;
-
-      const score = matchRatio * entry.confidence * boost * freshnessMultiplier * referenceBoost * tagBoost;
-
-      results.push({ entry, score, matchedKeywords });
+    // Precompute freshness set — keeps keywordRank provably pure (no callbacks)
+    const freshEntryIds = new Set<string>();
+    for (const entry of allEntries) {
+      if (this.isFresh(entry)) freshEntryIds.add(entry.id);
     }
 
-    // Always include user entries even if no keyword match (they're always relevant)
+    const ctx: RankContext = {
+      currentBranch,
+      branchFilter,
+      topicBoost: TOPIC_BOOST,
+      freshEntryIds,
+    };
+
+    const ranked = keywordRank(allEntries, contextKeywords, minMatch, ctx);
+
+    // Policy: always include user entries even if no keyword match
+    const results: ScoredEntry[] = [...ranked];
     for (const entry of this.entries.values()) {
       if (entry.topic === 'user' && !results.find(r => r.entry.id === entry.id)) {
         results.push({ entry, score: entry.confidence * USER_ALWAYS_INCLUDE_SCORE_FRACTION, matchedKeywords: [] });
       }
     }
 
+    // Re-sort after policy injections to maintain score-descending invariant
     return results
       .sort((a, b) => b.score - a.score)
       .slice(0, maxResults);

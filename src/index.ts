@@ -16,6 +16,7 @@ import { readFile, writeFile } from 'fs/promises';
 import { MarkdownMemoryStore } from './store.js';
 import type { DetailLevel, TopicScope, TrustLevel } from './types.js';
 import { parseTopicScope, parseTrustLevel } from './types.js';
+import type { ScoredEntry } from './ranking.js';
 import { getLobeConfigs, type ConfigOrigin } from './config.js';
 import { ConfigManager } from './config-manager.js';
 import { normalizeArgs } from './normalize.js';
@@ -1013,8 +1014,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const threshold = minMatch ?? 0.2;
 
         // Resolve which lobes to search — follows the degradation ladder via resolveLobesForRead().
-        type ContextResult = { entry: import('./types.js').MemoryEntry; score: number; matchedKeywords: string[] };
-        const allLobeResults: ContextResult[] = [];
+        const allLobeResults: ScoredEntry[] = [];
         const ctxEntryLobeMap = new Map<string, string>(); // entry id → lobe name
         let label: string;
         let primaryStore: MarkdownMemoryStore | undefined;
