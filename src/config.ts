@@ -7,8 +7,10 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 import { execFileSync } from 'child_process';
 import path from 'path';
 import os from 'os';
-import type { MemoryConfig, BehaviorConfig } from './types.js';
+import type { MemoryConfig, BehaviorConfig, EmbedderConfig, EmbedderProvider } from './types.js';
 import { DEFAULT_STORAGE_BUDGET_BYTES } from './types.js';
+import type { Embedder } from './embedder.js';
+import { OllamaEmbedder, LazyEmbedder } from './embedder.js';
 import {
   DEFAULT_STALE_DAYS_STANDARD,
   DEFAULT_STALE_DAYS_PREFERENCES,
@@ -30,6 +32,8 @@ export interface LoadedConfig {
   readonly origin: ConfigOrigin;
   /** Resolved behavior config — present when a "behavior" block was found in memory-config.json */
   readonly behavior?: BehaviorConfig;
+  /** Resolved embedder — shared across all lobes. Constructed from config or auto-detected. */
+  readonly embedder?: Embedder;
 }
 
 interface MemoryConfigFileBehavior {
@@ -38,6 +42,14 @@ interface MemoryConfigFileBehavior {
   maxStaleInBriefing?: number;
   maxDedupSuggestions?: number;
   maxConflictPairs?: number;
+}
+
+interface MemoryConfigFileEmbedder {
+  provider?: string;
+  model?: string;
+  baseUrl?: string;
+  timeoutMs?: number;
+  dimensions?: number;
 }
 
 interface MemoryConfigFile {
@@ -49,6 +61,8 @@ interface MemoryConfigFile {
   }>;
   /** Optional global behavior overrides applied to all lobes */
   behavior?: MemoryConfigFileBehavior;
+  /** Optional embedding provider config — absent means auto-detect */
+  embedder?: MemoryConfigFileEmbedder;
 }
 
 /** Validate and clamp a numeric threshold to a given range.
@@ -92,6 +106,73 @@ export function parseBehaviorConfig(raw?: MemoryConfigFileBehavior): BehaviorCon
     maxDedupSuggestions: clampThreshold(raw.maxDedupSuggestions, DEFAULT_MAX_DEDUP_SUGGESTIONS, 1, 10),
     maxConflictPairs: clampThreshold(raw.maxConflictPairs, DEFAULT_MAX_CONFLICT_PAIRS, 1, 5),
   };
+}
+
+/** Known embedder config keys — used to warn on typos/unknown fields. */
+const KNOWN_EMBEDDER_KEYS = new Set<string>([
+  'provider', 'model', 'baseUrl', 'timeoutMs', 'dimensions',
+]);
+
+const VALID_PROVIDERS = new Set<string>(['ollama', 'none']);
+
+/** Parse and validate an embedder config block.
+ *  Returns undefined when block is absent (auto-detect mode).
+ *  Exported for testing. */
+export function parseEmbedderConfig(raw?: MemoryConfigFileEmbedder): EmbedderConfig | undefined {
+  if (!raw) return undefined;
+
+  // Warn on unrecognized keys
+  for (const key of Object.keys(raw)) {
+    if (!KNOWN_EMBEDDER_KEYS.has(key)) {
+      process.stderr.write(
+        `[memory-mcp] Unknown embedder config key "${key}" — ignored. ` +
+        `Valid keys: ${Array.from(KNOWN_EMBEDDER_KEYS).join(', ')}\n`
+      );
+    }
+  }
+
+  // Validate provider — default to 'ollama' if present but not set
+  const provider: EmbedderProvider = raw.provider && VALID_PROVIDERS.has(raw.provider)
+    ? raw.provider as EmbedderProvider
+    : 'ollama';
+
+  if (raw.provider && !VALID_PROVIDERS.has(raw.provider)) {
+    process.stderr.write(
+      `[memory-mcp] Unknown embedder provider "${raw.provider}" — using "ollama". Valid: ${Array.from(VALID_PROVIDERS).join(', ')}\n`
+    );
+  }
+
+  return {
+    provider,
+    model: raw.model,
+    baseUrl: raw.baseUrl,
+    timeoutMs: raw.timeoutMs !== undefined
+      ? clampThreshold(raw.timeoutMs, 5000, 500, 30000)
+      : undefined,
+    dimensions: raw.dimensions !== undefined
+      ? clampThreshold(raw.dimensions, 384, 64, 4096)
+      : undefined,
+  };
+}
+
+/** Create an Embedder from config.
+ *  - provider "none" → null (keyword-only)
+ *  - provider "ollama" → LazyEmbedder wrapping OllamaEmbedder with config params
+ *  - No config (auto-detect) → LazyEmbedder wrapping default OllamaEmbedder */
+export function createEmbedderFromConfig(config?: EmbedderConfig): Embedder | undefined {
+  // Explicit opt-out
+  if (config?.provider === 'none') return undefined;
+
+  // Explicit or default Ollama config
+  const candidate = new OllamaEmbedder({
+    model: config?.model,
+    baseUrl: config?.baseUrl,
+    timeoutMs: config?.timeoutMs,
+    dimensions: config?.dimensions,
+  });
+
+  // Both explicit "ollama" and auto-detect use LazyEmbedder for fast startup
+  return new LazyEmbedder(candidate);
 }
 
 function resolveRoot(root: string): string {
@@ -139,7 +220,7 @@ function resolveMemoryPath(repoRoot: string, workspaceName: string, explicitMemo
 /** If no lobe has alwaysInclude: true AND the legacy global store directory has actual entries,
  *  auto-create a "global" lobe pointing to it. Protects existing users who haven't updated their config.
  *  Only fires when the dir contains .md files — an empty dir doesn't trigger creation. */
-function ensureAlwaysIncludeLobe(configs: Map<string, MemoryConfig>, behavior?: BehaviorConfig): void {
+function ensureAlwaysIncludeLobe(configs: Map<string, MemoryConfig>, behavior?: BehaviorConfig, embedder?: Embedder): void {
   const hasAlwaysInclude = Array.from(configs.values()).some(c => c.alwaysInclude);
   if (hasAlwaysInclude) return;
 
@@ -171,6 +252,7 @@ function ensureAlwaysIncludeLobe(configs: Map<string, MemoryConfig>, behavior?: 
     storageBudgetBytes: DEFAULT_STORAGE_BUDGET_BYTES,
     alwaysInclude: true,
     behavior,
+    embedder,
   });
   process.stderr.write(`[memory-mcp] Auto-created "global" lobe (alwaysInclude) from existing ${globalPath}\n`);
 }
@@ -195,6 +277,8 @@ export function getLobeConfigs(): LoadedConfig {
     } else {
       // Parse global behavior config once — applies to all lobes
       const behavior = parseBehaviorConfig(external.behavior);
+      const embedderConfig = parseEmbedderConfig(external.embedder);
+      const embedder = createEmbedderFromConfig(embedderConfig);
 
       for (const [name, config] of Object.entries(external.lobes)) {
         if (!config.root) {
@@ -208,15 +292,16 @@ export function getLobeConfigs(): LoadedConfig {
           storageBudgetBytes: (config.budgetMB ?? 2) * 1024 * 1024,
           alwaysInclude: config.alwaysInclude ?? false,
           behavior,
+          embedder,
         });
       }
 
       if (configs.size > 0) {
         // Reuse the already-parsed behavior config for the alwaysInclude fallback
         const resolvedBehavior = external.behavior ? behavior : undefined;
-        ensureAlwaysIncludeLobe(configs, resolvedBehavior);
+        ensureAlwaysIncludeLobe(configs, resolvedBehavior, embedder);
         process.stderr.write(`[memory-mcp] Loaded ${configs.size} lobe(s) from memory-config.json\n`);
-        return { configs, origin: { source: 'file', path: configPath }, behavior: resolvedBehavior };
+        return { configs, origin: { source: 'file', path: configPath }, behavior: resolvedBehavior, embedder };
       }
     }
   } catch (error: unknown) {
@@ -227,6 +312,9 @@ export function getLobeConfigs(): LoadedConfig {
       process.stderr.write(`[memory-mcp] Failed to parse memory-config.json: ${message}\n`);
     }
   }
+
+  // Auto-detect embedder for env var and default modes (no config file)
+  const autoEmbedder = createEmbedderFromConfig(undefined);
 
   // 2. Try env var multi-repo mode
   const workspacesJson = process.env.MEMORY_MCP_WORKSPACES;
@@ -243,12 +331,13 @@ export function getLobeConfigs(): LoadedConfig {
           memoryPath: resolveMemoryPath(repoRoot, name, explicitDir),
           storageBudgetBytes: storageBudget,
           alwaysInclude: false,
+          embedder: autoEmbedder,
         });
       }
       if (configs.size > 0) {
-        ensureAlwaysIncludeLobe(configs);
+        ensureAlwaysIncludeLobe(configs, undefined, autoEmbedder);
         process.stderr.write(`[memory-mcp] Loaded ${configs.size} lobe(s) from MEMORY_MCP_WORKSPACES env var\n`);
-        return { configs, origin: { source: 'env' } };
+        return { configs, origin: { source: 'env' }, embedder: autoEmbedder };
       }
     } catch (e) {
       process.stderr.write(`[memory-mcp] Failed to parse MEMORY_MCP_WORKSPACES: ${e}\n`);
@@ -265,9 +354,10 @@ export function getLobeConfigs(): LoadedConfig {
     memoryPath: resolveMemoryPath(repoRoot, 'default', explicitDir),
     storageBudgetBytes: storageBudget,
     alwaysInclude: false,
+    embedder: autoEmbedder,
   });
   // No ensureAlwaysIncludeLobe here — single-repo default users have everything in one lobe
   process.stderr.write(`[memory-mcp] Using single-lobe default mode (cwd: ${repoRoot})\n`);
 
-  return { configs, origin: { source: 'default' } };
+  return { configs, origin: { source: 'default' }, embedder: autoEmbedder };
 }

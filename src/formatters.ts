@@ -12,6 +12,27 @@ import {
 import { analyzeFilterGroups, type FilterGroup, type QueryMode } from './text-analyzer.js';
 import type { MarkdownMemoryStore } from './store.js';
 
+/** Format the search mode indicator for context/recall responses.
+ *  Pure function — no I/O, no state.
+ *
+ *  Shows whether semantic search is active and vector coverage. */
+export function formatSearchMode(
+  embedderAvailable: boolean,
+  vectorCount: number,
+  totalCount: number,
+): string {
+  if (!embedderAvailable) {
+    return '*Search: keyword-only (install Ollama for semantic search)*';
+  }
+  if (vectorCount === 0 && totalCount > 0) {
+    return `*Search: semantic + keyword (0/${totalCount} entries vectorized — run memory_reembed)*`;
+  }
+  if (totalCount === 0) {
+    return '*Search: semantic + keyword (no entries yet)*';
+  }
+  return `*Search: semantic + keyword (${vectorCount}/${totalCount} entries vectorized)*`;
+}
+
 /** Format the stale entries section for briefing/context responses */
 export function formatStaleSection(staleDetails: readonly StaleEntry[]): string {
   const lines = [
@@ -74,12 +95,13 @@ export function formatStats(lobe: string, result: MemoryStats): string {
     : '  (none)';
 
   const corruptLine = result.corruptFiles > 0 ? `\n**Corrupt files:** ${result.corruptFiles}` : '';
+  const vectorLine = `\n**Vectors:** ${result.vectorCount}/${result.totalEntries} entries vectorized`;
 
   return [
     `## [${lobe}] Memory Stats`,
     ``,
     `**Memory location:** ${result.memoryPath}`,
-    `**Total entries:** ${result.totalEntries}${corruptLine}`,
+    `**Total entries:** ${result.totalEntries}${corruptLine}${vectorLine}`,
     `**Storage:** ${result.storageSize} / ${Math.round(result.storageBudgetBytes / 1024 / 1024)}MB budget`,
     ``,
     `### By Topic`,

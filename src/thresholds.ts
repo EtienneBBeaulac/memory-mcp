@@ -66,6 +66,11 @@ export const SEMANTIC_MIN_SIMILARITY = 0.45;
  *  flagged as potential duplicates. */
 export const DEDUP_SEMANTIC_THRESHOLD = 0.80;
 
+/** Query-time embed timeout — tighter than store-time (5s) for responsiveness.
+ *  Model-warm latency is ~10ms; 2s covers machine-under-load with margin.
+ *  Cold starts handled by LazyEmbedder's probe (which uses the full 5s). */
+export const QUERY_EMBED_TIMEOUT_MS = 2000;
+
 /** Score multiplier when a reference path basename matches the context keywords. */
 export const REFERENCE_BOOST_MULTIPLIER = 1.30;
 

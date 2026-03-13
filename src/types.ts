@@ -235,6 +235,7 @@ export type CorrectResult =
 export interface MemoryStats {
   readonly totalEntries: number;
   readonly corruptFiles: number;
+  readonly vectorCount: number;
   readonly byTopic: Record<string, number>;
   readonly byTrust: Record<TrustLevel, number>;
   readonly byFreshness: { fresh: number; stale: number; unknown: number };
@@ -291,6 +292,27 @@ export interface BehaviorConfig {
   readonly maxDedupSuggestions?: number;
   /** Maximum conflict pairs shown per query/context response. Default: 2. Range: 1–5. */
   readonly maxConflictPairs?: number;
+}
+
+/** Supported embedding providers — closed union for exhaustive handling. */
+export type EmbedderProvider = 'ollama' | 'none';
+
+/** Embedding configuration from memory-config.json "embedder" block.
+ *  All fields optional except provider — defaults are sensible for nomic-embed-text on localhost. */
+export interface EmbedderConfig {
+  readonly provider: EmbedderProvider;
+  readonly model?: string;        // default: 'nomic-embed-text'
+  readonly baseUrl?: string;      // default: 'http://localhost:11434'
+  readonly timeoutMs?: number;    // default: 5000, clamped to [500, 30000]
+  readonly dimensions?: number;   // default: 384
+}
+
+/** Result of a re-embed operation */
+export interface ReEmbedResult {
+  readonly embedded: number;
+  readonly skipped: number;
+  readonly failed: number;
+  readonly error?: string;
 }
 
 /** Configuration for the memory MCP */

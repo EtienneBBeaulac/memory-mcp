@@ -2071,6 +2071,106 @@ describe('Zero-keyword query with embedder', () => {
   });
 });
 
+// ─── reEmbed ────────────────────────────────────────────────────────────
+
+describe('reEmbed', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await createTempDir();
+  });
+
+  afterEach(async () => {
+    if (tempDir) await cleanupTempDir(tempDir).catch(() => {});
+  });
+
+  it('embeds all entries that lack vectors', async () => {
+    // Store entries without embedder
+    const store1 = new MarkdownMemoryStore(makeConfig(tempDir));
+    await store1.init();
+    await store1.store('architecture', 'Entry 1', 'First entry content');
+    await store1.store('architecture', 'Entry 2', 'Second entry content');
+    await store1.store('gotchas', 'Entry 3', 'Third entry content');
+
+    // Re-embed with embedder
+    const store2 = new MarkdownMemoryStore(makeConfigWithEmbedder(tempDir));
+    await store2.init();
+
+    const result = await store2.reEmbed();
+    assert.strictEqual(result.embedded, 3);
+    assert.strictEqual(result.skipped, 0);
+    assert.strictEqual(result.failed, 0);
+    assert.strictEqual(result.error, undefined);
+  });
+
+  it('is idempotent — running twice skips all entries', async () => {
+    const store = new MarkdownMemoryStore(makeConfigWithEmbedder(tempDir));
+    await store.init();
+    await store.store('architecture', 'Entry 1', 'Content');
+    await store.store('architecture', 'Entry 2', 'Content');
+
+    // First run: embeds all (entries were stored with embedder, so they have vectors)
+    const first = await store.reEmbed();
+    assert.strictEqual(first.skipped, 2, 'First run: already vectorized via store()');
+    assert.strictEqual(first.embedded, 0);
+
+    // Second run: all should be skipped
+    const second = await store.reEmbed();
+    assert.strictEqual(second.skipped, 2);
+    assert.strictEqual(second.embedded, 0);
+  });
+
+  it('returns error when no embedder configured', async () => {
+    const store = new MarkdownMemoryStore(makeConfig(tempDir));
+    await store.init();
+
+    const result = await store.reEmbed();
+    assert.ok(result.error);
+    assert.ok(result.error.includes('No embedder'));
+  });
+
+  it('returns error when embedder probe fails', async () => {
+    const failingEmbedder: Embedder = {
+      dimensions: 64,
+      async embed(): Promise<EmbedResult> {
+        return { ok: false, failure: { kind: 'provider-unavailable', reason: 'test' } };
+      },
+    };
+
+    const store = new MarkdownMemoryStore({ ...makeConfig(tempDir), embedder: failingEmbedder });
+    await store.init();
+    await store.store('architecture', 'Test', 'Content');
+
+    // Create new store with failing embedder
+    const store2 = new MarkdownMemoryStore({ ...makeConfig(tempDir), embedder: failingEmbedder });
+    await store2.init();
+
+    const result = await store2.reEmbed();
+    assert.ok(result.error, 'Should report error');
+    assert.strictEqual(result.embedded, 0);
+  });
+
+  it('vectorCount appears in stats', async () => {
+    const store = new MarkdownMemoryStore(makeConfigWithEmbedder(tempDir));
+    await store.init();
+    await store.store('architecture', 'Entry 1', 'Content');
+    await store.store('architecture', 'Entry 2', 'Content');
+
+    const stats = await store.stats();
+    assert.strictEqual(stats.vectorCount, 2);
+    assert.strictEqual(stats.totalEntries, 2);
+  });
+
+  it('vectorCount is 0 without embedder', async () => {
+    const store = new MarkdownMemoryStore(makeConfig(tempDir));
+    await store.init();
+    await store.store('architecture', 'Entry 1', 'Content');
+
+    const stats = await store.stats();
+    assert.strictEqual(stats.vectorCount, 0);
+  });
+});
+
 /** Recursively find all files in a directory */
 async function findAllFiles(dir: string): Promise<string[]> {
   const results: string[] = [];
