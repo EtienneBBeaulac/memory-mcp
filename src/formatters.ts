@@ -3,7 +3,7 @@
 // Pure functions — no side effects, no state. Each takes structured data
 // and returns a formatted string for the tool response.
 
-import type { MemoryStats, StaleEntry, ConflictPair, BehaviorConfig } from './types.js';
+import type { MemoryStats, StaleEntry, ConflictPair, BehaviorConfig, RelatedEntry } from './types.js';
 import {
   DEFAULT_STALE_DAYS_STANDARD, DEFAULT_STALE_DAYS_PREFERENCES,
   DEFAULT_MAX_STALE_IN_BRIEFING, DEFAULT_MAX_DEDUP_SUGGESTIONS, DEFAULT_MAX_CONFLICT_PAIRS,
@@ -31,6 +31,17 @@ export function formatSearchMode(
     return '*Search: semantic + keyword (no entries yet)*';
   }
   return `*Search: semantic + keyword (${vectorCount}/${totalCount} entries vectorized)*`;
+}
+
+/** Format the loot-drop section — related entries shown after a storage operation.
+ *  Transforms storage from "chore for the future" into "immediate value exchange."
+ *  Pure function. */
+export function formatLootDrop(related: readonly RelatedEntry[]): string {
+  if (related.length === 0) return '';
+  const lines = related.map(r =>
+    `- [${r.id}] "${r.title}" (confidence: ${r.confidence.toFixed(2)})`
+  );
+  return `\n**Related knowledge:**\n${lines.join('\n')}`;
 }
 
 /** Format the stale entries section for briefing/context responses */

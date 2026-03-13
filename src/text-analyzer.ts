@@ -287,3 +287,35 @@ export function computeRelevanceScore(
 
   return bestScore * confidence;
 }
+
+/** Maximum title length before truncation */
+const MAX_TITLE_LENGTH = 80;
+
+/** Extract a title and content from a single observation string.
+ *  Title: first sentence (terminated by . ! ? or newline), capped at MAX_TITLE_LENGTH.
+ *  Content: the full observation text (title is a derived label, not subtracted).
+ *
+ *  Abbreviation-safe: requires 2+ word characters before the period to avoid
+ *  splitting on "e.g.", "U.S.", "i.e.", etc.
+ *
+ *  Pure function — no I/O, no side effects. */
+export function extractTitle(observation: string): { readonly title: string; readonly content: string } {
+  const trimmed = observation.trim();
+  if (trimmed.length === 0) return { title: '', content: '' };
+
+  // Find first sentence boundary.
+  // The lookbehind (?<=\w{2}) ensures we don't split on abbreviations like "e.g." or "U.S."
+  // where a period follows a single character. Newlines always end a sentence.
+  const sentenceMatch = trimmed.match(/(?<=\w{2})[.!?](?:\s|$)|\n/);
+  const sentenceEnd = sentenceMatch?.index ?? -1;
+  const firstSentence = sentenceEnd >= 0
+    ? trimmed.slice(0, sentenceEnd + 1).trim()
+    : trimmed;
+
+  // Truncate if too long
+  const title = firstSentence.length <= MAX_TITLE_LENGTH
+    ? firstSentence
+    : firstSentence.slice(0, MAX_TITLE_LENGTH - 3).trimEnd() + '...';
+
+  return { title, content: trimmed };
+}

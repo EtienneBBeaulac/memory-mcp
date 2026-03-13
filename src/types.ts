@@ -28,10 +28,11 @@ export type TopicScope =
   | 'architecture'
   | 'conventions'
   | 'gotchas'
+  | 'general'
   | 'recent-work'
   | `modules/${string}`;
 
-const FIXED_TOPICS: readonly string[] = ['user', 'preferences', 'architecture', 'conventions', 'gotchas', 'recent-work'];
+const FIXED_TOPICS: readonly string[] = ['user', 'preferences', 'architecture', 'conventions', 'gotchas', 'general', 'recent-work'];
 
 /** Validated tag: lowercase alphanumeric slug (letters, digits, hyphens).
  *  Branded type prevents accidentally passing raw strings where validated tags are expected. */
