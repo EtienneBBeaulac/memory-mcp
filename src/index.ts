@@ -279,7 +279,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     // --- Retrieval ---
     {
       name: 'brief',
-      description: `Session-start briefing. Returns preferences, gotchas overview, stale entries, and entry counts. Call once at the beginning of a conversation to load context. Usage: {"lobe": "${currentLobeNames[0] ?? 'my-project'}"}`,
+      description: `Session start for a project. Returns your preferences (global), gotchas, and recent work for this project and branch. Also surfaces stale entries that need review. Call once at the beginning of a conversation. Lobe names: ${currentLobeNames.join(', ') || 'none configured'}. Example: brief(lobe: "${currentLobeNames[0] ?? 'my-project'}")`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -290,7 +290,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'recall',
-      description: `Pre-task knowledge lookup. Describe what you are about to do and get relevant stored knowledge via semantic + keyword search. Usage: {"context": "implementing auth token refresh", "lobe": "${currentLobeNames[0] ?? 'my-project'}"}`,
+      description: `Search stored knowledge by relevance within a project. BEFORE starting a task, describe what you are about to do in natural language and get relevant knowledge back (semantic + keyword search). Example: recall(lobe: "${currentLobeNames[0] ?? 'my-project'}", context: "how does auth token refresh work") or recall(lobe: "${currentLobeNames[0] ?? 'my-project'}", context: "refactoring the payment webhook handler")`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -310,7 +310,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'gotchas',
-      description: `List stored gotchas (pitfalls, traps, surprising behaviors). Optionally filter by area. Usage: {"lobe": "${currentLobeNames[0] ?? 'my-project'}", "area": "auth"} or {"lobe": "${currentLobeNames[0] ?? 'my-project'}"} for all gotchas.`,
+      description: `Pitfalls in a project, optionally scoped to an area. Check BEFORE making changes to avoid known traps. Example: gotchas(lobe: "${currentLobeNames[0] ?? 'my-project'}", area: "auth") or gotchas(lobe: "${currentLobeNames[0] ?? 'my-project'}") for all gotchas.`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -325,7 +325,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'conventions',
-      description: `List stored conventions (patterns, rules, standards). Optionally filter by area. Usage: {"lobe": "${currentLobeNames[0] ?? 'my-project'}", "area": "testing"} or {"lobe": "${currentLobeNames[0] ?? 'my-project'}"} for all conventions.`,
+      description: `Coding patterns and standards in a project, optionally scoped to an area. Check BEFORE writing new code to follow established patterns. Example: conventions(lobe: "${currentLobeNames[0] ?? 'my-project'}", area: "testing") or conventions(lobe: "${currentLobeNames[0] ?? 'my-project'}") for all conventions.`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -342,7 +342,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     // --- Storage ---
     {
       name: 'gotcha',
-      description: `Store a gotcha — a pitfall, surprising behavior, or trap you discovered. Write naturally; the first sentence becomes the title automatically. Usage: {"lobe": "${currentLobeNames[0] ?? 'my-project'}", "observation": "Gradle cache must be cleaned after Tuist changes or builds silently use stale artifacts"}`,
+      description: `Flag a pitfall you hit — what you expected vs what actually happened. Gets priority in brief and recall results. Returns related knowledge you might want to review. Example: gotcha(lobe: "${currentLobeNames[0] ?? 'my-project'}", observation: "Gradle cache must be cleaned after Tuist changes or builds silently use stale artifacts")`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -363,7 +363,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'convention',
-      description: `Store a convention — a pattern, rule, or standard the codebase follows. Write naturally; the first sentence becomes the title automatically. Usage: {"lobe": "${currentLobeNames[0] ?? 'my-project'}", "observation": "All ViewModels use StateFlow for UI state. LiveData is banned."}`,
+      description: `Record a codebase pattern you observed — how the code is structured, naming rules, architectural decisions. For personal rules or preferences, use prefer() instead. Returns related knowledge. Example: convention(lobe: "${currentLobeNames[0] ?? 'my-project'}", observation: "All ViewModels use StateFlow for UI state. LiveData is banned.")`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -384,7 +384,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'learn',
-      description: `Store a general observation — architecture decisions, dependency info, or any insight worth remembering. Write naturally; the first sentence becomes the title automatically. Usage: {"lobe": "${currentLobeNames[0] ?? 'my-project'}", "observation": "The messaging feature uses MVVM with a FlowCoordinator for navigation state"}`,
+      description: `Store architecture, dependencies, decisions, progress, or any knowledge not covered by gotcha() or convention(). Use this as the catch-all for insights worth remembering. Returns related knowledge. Example: learn(lobe: "${currentLobeNames[0] ?? 'my-project'}", observation: "Payments module depends on auth for tokens only — no other cross-module dependency")`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -405,7 +405,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'prefer',
-      description: `Store a user preference or working style rule. Stored with high trust (user-level). Usage: {"rule": "Always suggest the simplest solution first"} — omit lobe for global, or add {"rule": "...", "lobe": "${currentLobeNames[0] ?? 'my-project'}"} to scope to a project.`,
+      description: `When your user corrects you or states a working-style rule, record it here. Persists globally by default and is surfaced in every brief(). Optionally scope to a specific project. Example: prefer(rule: "Never use !! operator") or prefer(rule: "Use Anvil for DI", lobe: "${currentLobeNames[0] ?? 'my-project'}")`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -425,7 +425,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     // --- Maintenance ---
     {
       name: 'fix',
-      description: `Fix or delete a stored entry. Pass correction to replace content; omit correction to delete. Usage: {"id": "gotcha-3f7a", "correction": "Updated: cache must be cleaned after ANY dependency change"} to replace, or {"id": "gotcha-3f7a"} to delete.`,
+      description: `Correct or delete a memory entry. IDs appear in brief(), recall(), gotchas(), and conventions() results. Pass correction to update content; omit correction to delete the entry entirely. Example: fix(id: "gotcha-a1b2c3d4", correction: "Fixed in v2.3 — cache is auto-cleaned now") or fix(id: "gotcha-a1b2c3d4") to delete.`,
       inputSchema: {
         type: 'object' as const,
         properties: {
