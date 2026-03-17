@@ -344,20 +344,37 @@ export function getLobeConfigs(): LoadedConfig {
     }
   }
 
-  // 3. Fall back to single-repo default
-  const repoRoot = process.env.MEMORY_MCP_REPO_ROOT ?? process.cwd();
-  const explicitDir = process.env.MEMORY_MCP_DIR;
-  const storageBudget = parseInt(process.env.MEMORY_MCP_BUDGET ?? '', 10) || DEFAULT_STORAGE_BUDGET_BYTES;
+  // 3. Single-repo fallback: only when MEMORY_MCP_REPO_ROOT is explicitly set
+  //    (Using cwd() as a fallback caused cross-project contamination in shared MCP instances)
+  const explicitRepoRoot = process.env.MEMORY_MCP_REPO_ROOT;
+  if (explicitRepoRoot) {
+    const lobeName = path.basename(explicitRepoRoot);
+    const explicitDir = process.env.MEMORY_MCP_DIR;
+    const storageBudget = parseInt(process.env.MEMORY_MCP_BUDGET ?? '', 10) || DEFAULT_STORAGE_BUDGET_BYTES;
 
-  configs.set('default', {
-    repoRoot,
-    memoryPath: resolveMemoryPath(repoRoot, 'default', explicitDir),
-    storageBudgetBytes: storageBudget,
-    alwaysInclude: false,
-    embedder: autoEmbedder,
-  });
-  // No ensureAlwaysIncludeLobe here — single-repo default users have everything in one lobe
-  process.stderr.write(`[memory-mcp] Using single-lobe default mode (cwd: ${repoRoot})\n`);
+    if (!lobeName || lobeName === path.sep || lobeName === '/') {
+      process.stderr.write(
+        `[memory-mcp] MEMORY_MCP_REPO_ROOT="${explicitRepoRoot}" has an invalid basename — cannot derive a lobe name. ` +
+        `Use a path like "/path/to/my-project". Starting with zero lobes.\n`
+      );
+    } else {
+      configs.set(lobeName, {
+        repoRoot: explicitRepoRoot,
+        memoryPath: resolveMemoryPath(explicitRepoRoot, lobeName, explicitDir),
+        storageBudgetBytes: storageBudget,
+        alwaysInclude: false,
+        embedder: autoEmbedder,
+      });
+      process.stderr.write(`[memory-mcp] Single-lobe mode via MEMORY_MCP_REPO_ROOT: lobe="${lobeName}" root="${explicitRepoRoot}"\n`);
+      return { configs, origin: { source: 'default' }, embedder: autoEmbedder };
+    }
+  }
 
+  // No configuration found — start with zero lobes
+  // Agents will be guided to run memory_bootstrap() to create lobes
+  process.stderr.write(
+    `[memory-mcp] No lobes configured. Agents will be prompted to run memory_bootstrap() when they first call a tool.\n` +
+    `[memory-mcp] To configure lobes: create memory-config.json, set MEMORY_MCP_WORKSPACES, or set MEMORY_MCP_REPO_ROOT.\n`
+  );
   return { configs, origin: { source: 'default' }, embedder: autoEmbedder };
 }

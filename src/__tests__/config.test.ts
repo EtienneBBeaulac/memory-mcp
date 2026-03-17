@@ -124,28 +124,32 @@ describe('getLobeConfigs', () => {
   });
 
   describe('default fallback config (tier 3)', () => {
-    it('uses MEMORY_MCP_REPO_ROOT when no config file or env workspaces', () => {
+    it('uses MEMORY_MCP_REPO_ROOT when no config file or env workspaces — lobe name is basename', () => {
       clearConfigEnv();
       process.env.MEMORY_MCP_REPO_ROOT = tempDir;
 
       const { configs, origin } = getLobeConfigs();
 
-      // If there's no memory-config.json and no MEMORY_MCP_WORKSPACES,
-      // it should fall back to default
       if (origin.source === 'default') {
-        assert.ok(configs.has('default'), 'Should have a default lobe');
-        assert.strictEqual(configs.get('default')!.repoRoot, tempDir);
+        const expectedLobeName = path.basename(tempDir);
+        assert.ok(configs.has(expectedLobeName), `Should have a lobe named "${expectedLobeName}" (basename of MEMORY_MCP_REPO_ROOT)`);
+        assert.strictEqual(configs.get(expectedLobeName)!.repoRoot, tempDir);
+        assert.ok(!configs.has('default'), 'Should NOT have a lobe named "default"');
       }
     });
 
-    it('uses cwd when no env vars at all', () => {
+    it('returns zero lobes when no env vars at all', () => {
       clearConfigEnv();
-      // No env vars set — should use process.cwd()
-      const { configs } = getLobeConfigs();
-      assert.ok(configs.size >= 1, 'Should always return at least one lobe');
+      // No env vars set — no cwd() fallback anymore; should return zero lobes
+      const { configs, origin } = getLobeConfigs();
+      if (origin.source === 'default') {
+        // If file config exists in the test environment this branch won't be taken,
+        // but if it is taken, we should have zero lobes (no cwd fallback)
+        assert.ok(configs.size === 0, 'Should return zero lobes when no configuration is provided');
+      }
     });
 
-    it('uses explicit MEMORY_MCP_DIR for default lobe', () => {
+    it('uses explicit MEMORY_MCP_DIR for the lobe derived from MEMORY_MCP_REPO_ROOT', () => {
       clearConfigEnv();
       process.env.MEMORY_MCP_REPO_ROOT = tempDir;
       process.env.MEMORY_MCP_DIR = '.custom-memory';
@@ -153,7 +157,9 @@ describe('getLobeConfigs', () => {
       const { configs, origin } = getLobeConfigs();
 
       if (origin.source === 'default') {
-        const config = configs.get('default')!;
+        const expectedLobeName = path.basename(tempDir);
+        const config = configs.get(expectedLobeName)!;
+        assert.ok(config, `Should have lobe "${expectedLobeName}"`);
         assert.ok(config.memoryPath.includes('.custom-memory'),
           `Should use custom dir: ${config.memoryPath}`);
       }
