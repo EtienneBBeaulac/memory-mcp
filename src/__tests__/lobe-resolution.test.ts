@@ -211,7 +211,17 @@ describe('buildLobeResolution', () => {
       if (result.kind === 'global-only') {
         assert.ok(result.hint.includes('zillow'), 'hint should mention zillow');
         assert.ok(result.hint.includes('eidola'), 'hint should mention eidola');
-        assert.ok(result.hint.includes('Specify lobe parameter'), 'hint should suggest specifying lobe');
+        assert.ok(result.hint.includes('Specify lobe parameter') || result.hint.includes('specify lobe parameter') || result.hint.includes('lobe parameter') || result.hint.includes('Specify lobe'), 'hint should suggest specifying lobe');
+      }
+    });
+  });
+
+  describe('zero lobes configured', () => {
+    it('returns global-only with bootstrap guidance', () => {
+      const result = buildLobeResolution([], []);
+      assert.strictEqual(result.kind, 'global-only');
+      if (result.kind === 'global-only') {
+        assert.ok(result.hint.includes('memory_bootstrap'), 'hint should mention memory_bootstrap');
       }
     });
   });

@@ -15,6 +15,7 @@ import {
 import { z } from 'zod';
 import path from 'path';
 import { readFile, writeFile } from 'fs/promises';
+import { existsSync } from 'fs';
 import { MarkdownMemoryStore } from './store.js';
 import type { DetailLevel, TopicScope, TrustLevel } from './types.js';
 import { parseTopicScope, parseTrustLevel } from './types.js';
@@ -30,7 +31,7 @@ import {
 import { formatStaleSection, formatConflictWarning, formatStats, formatBehaviorConfigSection, mergeTagFrequencies, buildQueryFooter, buildBriefingTagPrimerSections, formatSearchMode, formatLootDrop } from './formatters.js';
 import { parseFilter, extractTitle, type FilterGroup } from './text-analyzer.js';
 import { VOCABULARY_ECHO_LIMIT, MAX_FOOTER_TAGS, WARN_SEPARATOR } from './thresholds.js';
-import { matchRootsToLobeNames, buildLobeResolution, type LobeResolution, type LobeRootConfig } from './lobe-resolution.js';
+import { matchRootsToLobeNames, buildLobeResolution, isPathPrefixOf, type LobeResolution, type LobeRootConfig } from './lobe-resolution.js';
 
 // --- Server health state ---
 // Tracks the degradation ladder: Running -> Degraded -> SafeMode
@@ -122,10 +123,23 @@ type ToolContext =
 function resolveToolContext(rawLobe: string | undefined): ToolContext {
   const lobeNames = configManager.getLobeNames();
 
+  // Zero lobes configured — guide agent to bootstrap
+  if (lobeNames.length === 0) {
+    return {
+      ok: false,
+      error: `No lobes configured. Run memory_bootstrap(lobe: 'your-project-name', root: '/absolute/path/to/repo') to create one. ` +
+        `After bootstrapping, retry your call with the lobe name you chose.`,
+    };
+  }
+
   // Default to single lobe when omitted
   const lobe = rawLobe || (lobeNames.length === 1 ? lobeNames[0] : undefined);
   if (!lobe) {
-    return { ok: false, error: `Lobe is required. Available: ${lobeNames.join(', ')}` };
+    return {
+      ok: false,
+      error: `Lobe is required. Available: ${lobeNames.join(', ')}. ` +
+        `If this is a new project, run memory_bootstrap(lobe: 'your-project-name', root: '/absolute/path/to/repo') to create a lobe for it.`,
+    };
   }
 
   // Check if lobe is degraded
@@ -183,8 +197,10 @@ function inferLobeFromPaths(paths: readonly string[]): string | undefined {
     for (const lobeName of lobeNames) {
       const config = configManager.getLobeConfig(lobeName);
       if (!config) continue;
-      // Check if the file path starts with or is inside the repo root
-      if (resolved.startsWith(config.repoRoot) || resolved.startsWith(path.basename(config.repoRoot))) {
+      // Check if the file path starts with or is inside the repo root (path-boundary aware)
+      const normalizedResolved = path.resolve(resolved);
+      const normalizedRoot = path.resolve(config.repoRoot);
+      if (isPathPrefixOf(normalizedRoot, normalizedResolved)) {
         matchedLobes.add(lobeName);
       }
     }
@@ -451,7 +467,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     // but are hidden from tool discovery. Agents use the new v2 tools above.
     {
       name: 'memory_bootstrap',
-      description: 'First time with a new codebase — scans repo structure, README, and build system to seed initial memory. Run once per project. Example: {"lobe": "my-project"} or {"lobe": "new-project", "root": "/path/to/repo"} to auto-create lobe.',
+      description: 'When no lobe exists for a project — run this before any other tool. Scans repo structure, README, and build system to create a named lobe and seed initial memory. Required param: "root" (absolute path to repo) when the lobe does not yet exist. Example: {"lobe": "my-project", "root": "/absolute/path/to/repo"}. After bootstrapping, all other tools become available for that lobe.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -1968,6 +1984,28 @@ async function main() {
 
   // Initialize ConfigManager with current config state
   configManager = new ConfigManager(configPath, { configs: lobeConfigs, origin: configOrigin }, stores, lobeHealth);
+
+  // Warn if a 'default' lobe data directory exists but no 'default' lobe is configured.
+  // This indicates a user who was relying on the old zero-config default mode.
+  if (!lobeConfigs.has('default')) {
+    const orphanCandidates = [
+      path.join(process.cwd(), '.memory', 'default'),
+      ...(process.env.MEMORY_MCP_DIR ? [path.join(process.env.MEMORY_MCP_DIR, 'default')] : []),
+    ];
+    for (const candidate of orphanCandidates) {
+      try {
+        if (existsSync(candidate)) {
+          process.stderr.write(
+            `[memory-mcp] WARNING: Found orphaned 'default' lobe data at ${candidate} but no 'default' lobe is configured.\n` +
+            `[memory-mcp] This data was created by the old zero-config default mode.\n` +
+            `[memory-mcp] To recover: run memory_bootstrap(lobe: 'your-project-name', root: '/path/to/repo') to create a named lobe,\n` +
+            `[memory-mcp] then manually move files from ${candidate}/ to the new lobe's memory directory.\n`
+          );
+          break;
+        }
+      } catch { /* ignore fs errors during startup check */ }
+    }
+  }
 
   const transport = new StdioServerTransport();
 

@@ -28,7 +28,7 @@ export interface LobeRootConfig {
 
 /** Check if `child` is equal to or nested under `parent` with path-boundary awareness.
  *  Prevents false matches like "/projects/zillow-tools" matching "/projects/zillow". */
-function isPathPrefixOf(parent: string, child: string): boolean {
+export function isPathPrefixOf(parent: string, child: string): boolean {
   if (child === parent) return true;
   // Ensure the prefix ends at a path separator boundary
   const withSep = parent.endsWith(path.sep) ? parent : parent + path.sep;
@@ -114,9 +114,16 @@ export function buildLobeResolution(
   }
 
   // Fallback — no lobes could be determined
+  if (allLobeNames.length === 0) {
+    return {
+      kind: 'global-only',
+      hint: `No lobes configured. Run memory_bootstrap(lobe: 'your-project-name', root: '/absolute/path/to/repo') to create one.`,
+    };
+  }
   return {
     kind: 'global-only',
     hint: `Multiple lobes available (${allLobeNames.join(', ')}) but none could be inferred from client workspace roots. ` +
-      `Specify lobe parameter for lobe-specific results.`,
+      `Specify lobe parameter for lobe-specific results. ` +
+      `If this is a new project not in the list, run memory_bootstrap(lobe: 'your-project-name', root: '/absolute/path/to/repo') to add it.`,
   };
 }
