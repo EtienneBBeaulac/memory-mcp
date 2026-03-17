@@ -1749,16 +1749,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     // Tool-specific hints based on which field failed
     let hint = '';
+    const exampleLobe = lobeNames[0] ?? '<your-lobe>';
+    const lobeHint = lobeNames.length > 0 ? `Available lobes: ${lobeList}` : 'No lobes configured — run memory_bootstrap with a "root" path to create one.';
     const v2ToolHints: Record<string, string> = {
-      brief: `brief takes an optional lobe. Example: {"lobe": "${lobeNames[0] ?? 'default'}"}. Available lobes: ${lobeList}`,
-      recall: `recall requires "context" (describe what you are working on). Example: {"context": "implementing auth flow", "lobe": "${lobeNames[0] ?? 'default'}"}. Available lobes: ${lobeList}`,
-      gotcha: `gotcha requires "lobe" and "observation". Example: {"lobe": "${lobeNames[0] ?? 'default'}", "observation": "Gradle cache breaks after Tuist changes"}`,
-      convention: `convention requires "lobe" and "observation". Example: {"lobe": "${lobeNames[0] ?? 'default'}", "observation": "All ViewModels use StateFlow"}`,
-      learn: `learn requires "lobe" and "observation". Example: {"lobe": "${lobeNames[0] ?? 'default'}", "observation": "Messaging uses MVVM with FlowCoordinator"}`,
-      prefer: `prefer requires "rule". Example: {"rule": "Always suggest the simplest solution first"}`,
+      brief: `brief takes an optional lobe. Example: {"lobe": "${exampleLobe}"}. ${lobeHint}`,
+      recall: `recall requires "context" (the area you need knowledge about). Example: {"context": "auth token refresh", "lobe": "${exampleLobe}"}. ${lobeHint}`,
+      gotcha: `gotcha requires "lobe" and "observation". Example: {"lobe": "${exampleLobe}", "observation": "Gradle cache breaks after Tuist changes"}. ${lobeHint}`,
+      convention: `convention requires "lobe" and "observation". Example: {"lobe": "${exampleLobe}", "observation": "All ViewModels use StateFlow"}. ${lobeHint}`,
+      learn: `learn requires "lobe" and "observation". Example: {"lobe": "${exampleLobe}", "observation": "Messaging uses MVVM with FlowCoordinator"}. ${lobeHint}`,
+      prefer: `prefer requires "rule". Example: {"rule": "Always suggest the simplest solution first"}. Omit lobe for global; add "lobe" to scope to a project.`,
       fix: `fix requires "id". Optional: "correction" (new text; omit to delete). Example: {"id": "gotcha-3f7a", "correction": "updated text"}`,
-      gotchas: `gotchas takes optional "lobe" and "area". Example: {"lobe": "${lobeNames[0] ?? 'default'}", "area": "auth"}. Available lobes: ${lobeList}`,
-      conventions: `conventions takes optional "lobe" and "area". Example: {"lobe": "${lobeNames[0] ?? 'default'}", "area": "testing"}. Available lobes: ${lobeList}`,
+      gotchas: `gotchas takes optional "lobe" and "area". Example: {"lobe": "${exampleLobe}", "area": "auth"}. ${lobeHint}`,
+      conventions: `conventions takes optional "lobe" and "area". Example: {"lobe": "${exampleLobe}", "area": "testing"}. ${lobeHint}`,
     };
 
     if (name in v2ToolHints) {
