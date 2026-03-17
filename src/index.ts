@@ -738,9 +738,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               break;
             }
             case 'global-only': {
-              // No project lobes matched — ask agent to specify
+              // No project lobes matched — ask agent to specify or bootstrap
+              const lobeNames = configManager.getLobeNames();
+              const recallHint = lobeNames.length === 0
+                ? `No lobes configured. Run memory_bootstrap(lobe: "your-project-name", root: "/absolute/path/to/repo") to create one, then retry.`
+                : `Cannot determine which lobe to search. Specify the lobe: recall(lobe: "...", context: "${context}")\nAvailable: ${lobeNames.join(', ')}\nIf this is a new project, run memory_bootstrap(lobe: "your-project-name", root: "/absolute/path/to/repo") to create a lobe.`;
               return {
-                content: [{ type: 'text', text: `Cannot determine which lobe to search. Specify the lobe: recall(lobe: "...", context: "${context}")\nAvailable: ${configManager.getLobeNames().join(', ')}` }],
+                content: [{ type: 'text', text: recallHint }],
                 isError: true,
               };
             }
