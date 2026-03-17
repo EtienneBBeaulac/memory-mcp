@@ -25,16 +25,18 @@ const TOOL_ALIASES: Record<string, Record<string, string>> = {
   memory_store: { scope: 'topic' },
   // Legacy tools: "description"/"task" mean "context"
   memory_context: { description: 'context', task: 'context' },
-  // v2 retrieval tools: "query"/"search"/"description"/"task" mean "context"
-  recall: { query: 'context', search: 'context', description: 'context', task: 'context' },
-  // v2 storage tools: "content"/"note"/"fact" mean "observation"
-  gotcha: { content: 'observation', note: 'observation', fact: 'observation', message: 'observation' },
-  convention: { content: 'observation', note: 'observation', fact: 'observation', message: 'observation' },
-  learn: { content: 'observation', note: 'observation', fact: 'observation', message: 'observation' },
-  // v2 prefer: "preference"/"pref" mean "rule"
-  prefer: { preference: 'rule', pref: 'rule' },
-  // v2 fix: "text"/"content"/"replacement" mean "correction"
-  fix: { text: 'correction', content: 'correction', replacement: 'correction' },
+  // v2 retrieval tools: tool-name-as-param + common guesses map to "context"
+  recall: { recall: 'context', query: 'context', search: 'context', description: 'context', task: 'context', topic: 'context', area: 'context' },
+  // v2 brief: common guesses map to "lobe"
+  brief: { project: 'lobe' },
+  // v2 storage tools: tool-name-as-param + common guesses all map to "observation"
+  gotcha: { gotcha: 'observation', content: 'observation', note: 'observation', fact: 'observation', message: 'observation', pitfall: 'observation', trap: 'observation' },
+  convention: { convention: 'observation', content: 'observation', note: 'observation', fact: 'observation', message: 'observation', pattern: 'observation', rule: 'observation' },
+  learn: { learn: 'observation', knowledge: 'observation', insight: 'observation', content: 'observation', note: 'observation', fact: 'observation', message: 'observation' },
+  // v2 prefer: tool-name-as-param + common guesses map to "rule"
+  prefer: { prefer: 'rule', preference: 'rule', pref: 'rule', observation: 'rule', content: 'rule' },
+  // v2 fix: tool-name-as-param + common guesses map to "correction"
+  fix: { fix: 'correction', text: 'correction', content: 'correction', replacement: 'correction', update: 'correction' },
   // v2 retrieval: "filter"/"keyword" mean "area"
   gotchas: { filter: 'area', keyword: 'area', query: 'area', search: 'area' },
   conventions: { filter: 'area', keyword: 'area', query: 'area', search: 'area' },

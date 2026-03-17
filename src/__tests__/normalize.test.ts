@@ -231,5 +231,47 @@ describe('normalizeArgs', () => {
       const result = normalizeArgs('conventions', { filter: 'testing' }, singleLobe);
       assert.strictEqual(result['area'], 'testing');
     });
+
+    // Tool-name-as-param aliases (agents pass the tool name as the param key)
+    it('resolves "gotcha" to "observation" for gotcha tool', () => {
+      const result = normalizeArgs('gotcha', { lobe: 'x', gotcha: 'cache is stale' }, singleLobe);
+      assert.strictEqual(result['observation'], 'cache is stale');
+      assert.strictEqual(result['gotcha'], undefined);
+    });
+
+    it('resolves "convention" to "observation" for convention tool', () => {
+      const result = normalizeArgs('convention', { lobe: 'x', convention: 'use StateFlow' }, singleLobe);
+      assert.strictEqual(result['observation'], 'use StateFlow');
+      assert.strictEqual(result['convention'], undefined);
+    });
+
+    it('resolves "learn" to "observation" for learn tool', () => {
+      const result = normalizeArgs('learn', { lobe: 'x', learn: 'module depends on auth' }, singleLobe);
+      assert.strictEqual(result['observation'], 'module depends on auth');
+      assert.strictEqual(result['learn'], undefined);
+    });
+
+    it('resolves "knowledge" to "observation" for learn tool', () => {
+      const result = normalizeArgs('learn', { lobe: 'x', knowledge: 'architecture info' }, singleLobe);
+      assert.strictEqual(result['observation'], 'architecture info');
+    });
+
+    it('resolves "prefer" to "rule" for prefer tool', () => {
+      const result = normalizeArgs('prefer', { prefer: 'no !! operator' }, singleLobe);
+      assert.strictEqual(result['rule'], 'no !! operator');
+      assert.strictEqual(result['prefer'], undefined);
+    });
+
+    it('resolves "recall" to "context" for recall tool', () => {
+      const result = normalizeArgs('recall', { recall: 'auth tokens' }, singleLobe);
+      assert.strictEqual(result['context'], 'auth tokens');
+      assert.strictEqual(result['recall'], undefined);
+    });
+
+    it('resolves "fix" to "correction" for fix tool', () => {
+      const result = normalizeArgs('fix', { id: 'x', fix: 'updated info' }, singleLobe);
+      assert.strictEqual(result['correction'], 'updated info');
+      assert.strictEqual(result['fix'], undefined);
+    });
   });
 });

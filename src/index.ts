@@ -290,7 +290,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'recall',
-      description: `Search your stored memory entries (from learn/gotcha/convention/prefer) — architecture notes, conventions, gotchas, decisions — by relevance using semantic + keyword matching. Does NOT search the codebase itself. Use BEFORE starting a task to surface prior knowledge. Usage: {"context": "auth token refresh", "lobe": "${currentLobeNames[0] ?? 'my-project'}"}`,
+      description: `Search your stored memory entries (from learn/gotcha/convention/prefer) — architecture notes, conventions, gotchas, decisions — by relevance using semantic + keyword matching. Does NOT search the codebase itself. Use BEFORE starting a task to surface prior knowledge. Required param: "context". Usage: {"context": "auth token refresh", "lobe": "${currentLobeNames[0] ?? 'my-project'}"}`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -342,7 +342,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     // --- Storage ---
     {
       name: 'gotcha',
-      description: `Store a pitfall, surprising behavior, or trap you discovered in the codebase. Persists across sessions, surfaces in brief() and recall(). Write naturally; first sentence becomes the title. Usage: {"lobe": "${currentLobeNames[0] ?? 'my-project'}", "observation": "Gradle cache must be cleaned after Tuist changes or builds silently use stale artifacts"}`,
+      description: `Store a pitfall, surprising behavior, or trap you discovered in the codebase. Persists across sessions, surfaces in brief() and recall(). Write naturally; first sentence becomes the title. Required params: "lobe" and "observation". Usage: {"lobe": "${currentLobeNames[0] ?? 'my-project'}", "observation": "Gradle cache must be cleaned after Tuist changes or builds silently use stale artifacts"}`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -363,7 +363,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'convention',
-      description: `Store a coding pattern or standard the codebase follows. Persists across sessions, surfaces in brief() and recall(). Write naturally; first sentence becomes the title. Usage: {"lobe": "${currentLobeNames[0] ?? 'my-project'}", "observation": "All ViewModels use StateFlow for UI state. LiveData is banned."}`,
+      description: `Store a coding pattern or standard the codebase follows. Persists across sessions, surfaces in brief() and recall(). Write naturally; first sentence becomes the title. Required params: "lobe" and "observation". Usage: {"lobe": "${currentLobeNames[0] ?? 'my-project'}", "observation": "All ViewModels use StateFlow for UI state. LiveData is banned."}`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -384,7 +384,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'learn',
-      description: `Store codebase knowledge — architecture, module boundaries, dependencies, or any insight not covered by gotcha/convention. Catch-all for durable project knowledge. Persists across sessions, surfaces in brief() and recall(). Write naturally; first sentence becomes the title. Usage: {"lobe": "${currentLobeNames[0] ?? 'my-project'}", "observation": "Payments module depends on auth for tokens only — no other cross-module dependency"}`,
+      description: `Store codebase knowledge — architecture, module boundaries, dependencies, or any insight not covered by gotcha/convention. Catch-all for durable project knowledge. Persists across sessions, surfaces in brief() and recall(). Write naturally; first sentence becomes the title. Required params: "lobe" and "observation". Usage: {"lobe": "${currentLobeNames[0] ?? 'my-project'}", "observation": "Payments module depends on auth for tokens only, no other cross-module dependency"}`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -405,7 +405,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'prefer',
-      description: `Store a user preference or working-style rule — when the user corrects you or states how they want things done. Highest trust, surfaced in every brief(). Omit lobe for global. Usage: {"rule": "Never use !! operator"} or {"rule": "Use Anvil for DI", "lobe": "${currentLobeNames[0] ?? 'my-project'}"}`,
+      description: `Store a user preference or working-style rule — when the user corrects you or states how they want things done. Highest trust, surfaced in every brief(). Omit lobe for global. Required param: "rule". Usage: {"rule": "Never use !! operator"} or {"rule": "Use Anvil for DI", "lobe": "${currentLobeNames[0] ?? 'my-project'}"}`,
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -425,7 +425,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     // --- Maintenance ---
     {
       name: 'fix',
-      description: `Correct or delete a stored memory entry. IDs appear in brief/recall/gotchas/conventions results. Pass correction to update; omit correction to delete. Usage: {"id": "gotcha-3f7a", "correction": "Updated: cache must be cleaned after ANY dependency change"} or {"id": "gotcha-3f7a"} to delete.`,
+      description: `Correct or delete a stored memory entry. IDs appear in brief/recall/gotchas/conventions results. Required param: "id". Pass "correction" to update; omit to delete. Usage: {"id": "gotcha-3f7a", "correction": "Updated: cache must be cleaned after ANY dependency change"} or {"id": "gotcha-3f7a"} to delete.`,
       inputSchema: {
         type: 'object' as const,
         properties: {
