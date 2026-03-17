@@ -57,6 +57,18 @@ export class ConfigManager {
   }
 
   /**
+   * Adopt a newly created config file that didn't exist at startup.
+   * Used by memory_bootstrap when it creates memory-config.json from scratch.
+   * Switches the manager from default/env mode to file-based mode and reloads.
+   */
+  async adoptNewConfigFile(filePath: string): Promise<void> {
+    this.configPath = filePath;
+    this.configOrigin = { source: 'file', path: filePath };
+    this.configMtime = 0; // Force reload on next ensureFresh
+    await this.ensureFresh();
+  }
+
+  /**
    * Ensure config is fresh. Call at the start of every tool handler.
    * Stats config file, reloads if mtime changed. Graceful on all errors.
    */

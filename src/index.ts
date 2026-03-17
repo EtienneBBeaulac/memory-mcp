@@ -262,6 +262,13 @@ async function resolveLobesForRead(isFirstMemoryToolCall: boolean = true): Promi
 /** Build the shared lobe property for tool schemas — called on each ListTools request
  *  so the description and enum stay in sync after a hot-reload adds or removes lobes. */
 function buildLobeProperty(currentLobeNames: readonly string[]) {
+  if (currentLobeNames.length === 0) {
+    return {
+      type: 'string' as const,
+      description: 'Memory lobe name. No lobes configured yet — run memory_bootstrap(lobe: "your-project", root: "/absolute/path/to/repo") first.',
+      enum: undefined,
+    };
+  }
   const isSingle = currentLobeNames.length === 1;
   return {
     type: 'string' as const,
@@ -646,6 +653,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const sections: string[] = [];
         if (crashSection) sections.push(crashSection);
         if (degradedSection) sections.push(degradedSection);
+
+        // Zero lobes — guide agent to bootstrap before anything else
+        if (configManager.getLobeNames().length === 0) {
+          sections.push(
+            '## No Lobes Configured\n\n' +
+            'No memory lobes exist yet. Run **memory_bootstrap** to create one for this project:\n\n' +
+            '```\nmemory_bootstrap(lobe: "your-project-name", root: "/absolute/path/to/repo")\n```\n\n' +
+            'After bootstrapping, call **brief** again to load project context.'
+          );
+          return { content: [{ type: 'text', text: sections.join('\n\n---\n\n') }] };
+        }
 
         // Collect briefing across all lobes (or specified lobe + alwaysInclude)
         const briefingLobeNames = allBriefingLobes;
@@ -1669,39 +1687,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           budgetMB: z.number().positive().optional(),
         }).parse(args);
 
-        // Auto-create lobe: if the lobe is unknown AND root is provided AND config is
-        // file-based, write the new lobe entry into memory-config.json and hot-reload.
-        // This lets the agent bootstrap a brand-new repo in a single tool call.
+        // Auto-create lobe: if the lobe is unknown AND root is provided, write the new
+        // lobe entry into memory-config.json and hot-reload. If no config file exists yet,
+        // create one at cwd()/memory-config.json — this is the zero-config bootstrap path.
         if (rawLobe && root && !configManager.getStore(rawLobe)) {
           const origin = configManager.getConfigOrigin();
-          if (origin.source !== 'file') {
-            return {
-              content: [{
-                type: 'text',
-                text: `Cannot auto-add lobe "${rawLobe}": config is not file-based (source: ${origin.source}).\n\n` +
-                  `Create memory-config.json next to the memory MCP server with a "lobes" block, then retry.`,
-              }],
-              isError: true,
-            };
-          }
+
+          // Determine the config file path to write to:
+          // - If already file-based, use the existing file
+          // - Otherwise, create memory-config.json in cwd() (the server's working directory)
+          const targetConfigPath = origin.source === 'file'
+            ? origin.path
+            : path.join(process.cwd(), 'memory-config.json');
 
           try {
-            const raw = await readFile(origin.path, 'utf-8');
-            const config = JSON.parse(raw) as { lobes?: Record<string, unknown> };
+            let config: { lobes?: Record<string, unknown> } = {};
+            if (origin.source === 'file') {
+              const raw = await readFile(targetConfigPath, 'utf-8');
+              config = JSON.parse(raw) as { lobes?: Record<string, unknown> };
+            }
             if (!config.lobes || typeof config.lobes !== 'object') config.lobes = {};
             config.lobes[rawLobe] = { root, budgetMB: budgetMB ?? 2 };
-            await writeFile(origin.path, JSON.stringify(config, null, 2) + '\n', 'utf-8');
-            process.stderr.write(`[memory-mcp] Auto-added lobe "${rawLobe}" (root: ${root}) to memory-config.json\n`);
+            await writeFile(targetConfigPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+            process.stderr.write(`[memory-mcp] Auto-added lobe "${rawLobe}" (root: ${root}) to ${targetConfigPath}\n`);
           } catch (err: unknown) {
             const message = err instanceof Error ? err.message : String(err);
             return {
-              content: [{ type: 'text', text: `Failed to auto-add lobe "${rawLobe}" to memory-config.json: ${message}` }],
+              content: [{ type: 'text', text: `Failed to write lobe "${rawLobe}" to ${targetConfigPath}: ${message}` }],
               isError: true,
             };
           }
 
-          // Reload config to pick up the new lobe (hot-reload detects the updated mtime)
-          await configManager.ensureFresh();
+          // Reload config to pick up the new lobe.
+          // If the file was just created from scratch, adopt it as the new config source.
+          if (origin.source !== 'file') {
+            await configManager.adoptNewConfigFile(targetConfigPath);
+          } else {
+            await configManager.ensureFresh();
+          }
         }
 
         // Resolve store — after this point, rawLobe is never used again
