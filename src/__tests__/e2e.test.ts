@@ -67,6 +67,7 @@ class McpTestClient {
   constructor(
     private readonly repoRoot: string,
     private readonly memoryDir: string,
+    private readonly options: { readonly useEnvRepoRoot?: boolean } = {},
   ) {}
 
   /** Spawn the MCP server with env-based config pointing to our temp dir.
@@ -93,8 +94,9 @@ class McpTestClient {
     this.proc = spawn('node', ['--import', 'tsx', serverPath], {
       env: {
         ...process.env,
-        // Override config to use our temp dir as a single-lobe default
-        MEMORY_MCP_REPO_ROOT: this.repoRoot,
+        // Override config to use our temp dir as a single-lobe default unless
+        // this client is explicitly testing the zero-lobe startup path.
+        MEMORY_MCP_REPO_ROOT: this.options.useEnvRepoRoot === false ? '' : this.repoRoot,
         MEMORY_MCP_DIR: this.memoryDir,
         // Clear any existing config env vars so they don't interfere
         MEMORY_MCP_WORKSPACES: '',
@@ -277,6 +279,28 @@ describe('E2E: MCP Server', () => {
       assert.strictEqual(data.serverMode, 'running');
       assert.ok(data.lobes.length >= 1, 'Should have at least one lobe');
       assert.strictEqual(data.lobes[0].health, 'healthy');
+    });
+  });
+
+  describe('zero-lobe startup', () => {
+    it('stays operational and guides bootstrap instead of entering safe mode', async () => {
+      const zeroLobeClient = new McpTestClient(tempDir, memoryDir, { useEnvRepoRoot: false });
+      await zeroLobeClient.start();
+      try {
+        const lobeResp = await zeroLobeClient.callTool('memory_list_lobes');
+        assert.ok(!zeroLobeClient.isError(lobeResp), 'memory_list_lobes should still work');
+        const lobeData = JSON.parse(zeroLobeClient.getText(lobeResp));
+        assert.strictEqual(lobeData.serverMode, 'running');
+        assert.strictEqual(lobeData.lobes.length, 0);
+
+        const briefResp = await zeroLobeClient.callTool('brief');
+        assert.ok(!zeroLobeClient.isError(briefResp), 'brief should guide bootstrap, not fail safe-mode');
+        const briefText = zeroLobeClient.getText(briefResp);
+        assert.ok(briefText.includes('No Lobes Configured'));
+        assert.ok(briefText.includes('memory_bootstrap'));
+      } finally {
+        await zeroLobeClient.stop();
+      }
     });
   });
 

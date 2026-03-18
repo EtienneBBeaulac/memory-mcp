@@ -1986,8 +1986,10 @@ async function main() {
     }
   }
 
-  // Determine server mode based on lobe health
-  if (healthyLobes === 0) {
+  // Determine server mode based on lobe health.
+  // Zero configured lobes is a valid operational state: tools should stay available
+  // so the agent can bootstrap the first project lobe.
+  if (lobeConfigs.size > 0 && healthyLobes === 0) {
     serverMode = {
       kind: 'safe-mode',
       error: `All ${lobeConfigs.size} lobes failed to initialize.`,
