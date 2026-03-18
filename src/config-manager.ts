@@ -5,7 +5,7 @@
 // All tool handlers call ensureFresh() at entry to validate config is current.
 
 import { stat } from 'fs/promises';
-import type { MemoryConfig } from './types.js';
+import type { MemoryConfig, BehaviorConfig } from './types.js';
 import { getLobeConfigs, type LoadedConfig, type ConfigOrigin } from './config.js';
 import { MarkdownMemoryStore } from './store.js';
 
@@ -31,6 +31,7 @@ export class ConfigManager {
   private stores: Map<string, MarkdownMemoryStore>;
   private lobeHealth: Map<string, LobeHealth>;
   private configMtime: number;
+  private behaviorConfig?: BehaviorConfig;
   /** Cached alwaysInclude lobe names — recomputed atomically on reload. */
   private cachedAlwaysIncludeLobes: readonly string[];
 
@@ -46,6 +47,7 @@ export class ConfigManager {
     this.stores = initialStores;
     this.lobeHealth = initialHealth;
     this.configMtime = Date.now(); // Initial mtime (will be updated on first stat)
+    this.behaviorConfig = initial.behavior;
     this.cachedAlwaysIncludeLobes = ConfigManager.computeAlwaysIncludeLobes(this.lobeConfigs);
   }
 
@@ -139,6 +141,7 @@ export class ConfigManager {
       this.stores = newStores;
       this.lobeHealth = newHealth;
       this.configMtime = newMtime;
+      this.behaviorConfig = newConfig.behavior;
       this.cachedAlwaysIncludeLobes = ConfigManager.computeAlwaysIncludeLobes(newConfig.configs);
 
       const lobeCount = newConfig.configs.size;
@@ -168,6 +171,10 @@ export class ConfigManager {
 
   getConfigOrigin(): ConfigOrigin {
     return this.configOrigin;
+  }
+
+  getBehaviorConfig(): BehaviorConfig | undefined {
+    return this.behaviorConfig;
   }
 
   getLobeConfig(lobe: string): MemoryConfig | undefined {

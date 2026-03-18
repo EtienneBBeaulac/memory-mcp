@@ -302,6 +302,54 @@ describe('E2E: MCP Server', () => {
         await zeroLobeClient.stop();
       }
     });
+
+    it('guides bootstrap for other zero-lobe tools instead of returning misleading output', async () => {
+      const zeroLobeClient = new McpTestClient(tempDir, memoryDir, { useEnvRepoRoot: false });
+      await zeroLobeClient.start();
+      try {
+        const statsResp = await zeroLobeClient.callTool('memory_stats');
+        assert.ok(!zeroLobeClient.isError(statsResp), 'memory_stats should return guidance text');
+        assert.ok(zeroLobeClient.getText(statsResp).includes('memory_bootstrap'));
+
+        const contextResp = await zeroLobeClient.callTool('memory_context');
+        assert.ok(!zeroLobeClient.isError(contextResp), 'memory_context briefing should guide bootstrap');
+        assert.ok(zeroLobeClient.getText(contextResp).includes('No Lobes Configured'));
+
+        const preferResp = await zeroLobeClient.callTool('prefer', { rule: 'Prefer simple solutions' });
+        assert.ok(zeroLobeClient.isError(preferResp), 'prefer should error clearly when no lobes exist');
+        assert.ok(zeroLobeClient.getText(preferResp).includes('memory_bootstrap'));
+
+        const fixResp = await zeroLobeClient.callTool('fix', { id: 'fake-entry-id' });
+        assert.ok(zeroLobeClient.isError(fixResp), 'fix should error clearly when no lobes exist');
+        assert.ok(zeroLobeClient.getText(fixResp).includes('memory_bootstrap'));
+      } finally {
+        await zeroLobeClient.stop();
+      }
+    });
+
+    it('allows memory_bootstrap to create the first lobe from zero-lobe state', async () => {
+      const zeroLobeClient = new McpTestClient(tempDir, memoryDir, { useEnvRepoRoot: false });
+      await zeroLobeClient.start();
+      try {
+        const bootstrapResp = await zeroLobeClient.callTool('memory_bootstrap', {
+          lobe: 'test-first-lobe',
+          root: tempDir,
+          budgetMB: 2,
+        });
+        assert.ok(!zeroLobeClient.isError(bootstrapResp), `Bootstrap should succeed: ${zeroLobeClient.getText(bootstrapResp)}`);
+        const bootstrapText = zeroLobeClient.getText(bootstrapResp);
+        assert.ok(bootstrapText.includes('Bootstrap Complete'));
+
+        const lobeResp = await zeroLobeClient.callTool('memory_list_lobes');
+        assert.ok(!zeroLobeClient.isError(lobeResp));
+        const lobeData = JSON.parse(zeroLobeClient.getText(lobeResp));
+        assert.strictEqual(lobeData.serverMode, 'running');
+        assert.strictEqual(lobeData.configSource, 'file');
+        assert.ok(lobeData.lobes.some((lobe: { name: string }) => lobe.name === 'test-first-lobe'));
+      } finally {
+        await zeroLobeClient.stop();
+      }
+    });
   });
 
   describe('store -> query -> correct lifecycle', () => {
