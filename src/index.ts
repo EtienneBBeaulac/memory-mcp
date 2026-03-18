@@ -571,7 +571,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           lobes: lobeInfo,
           alwaysIncludeLobes: alwaysIncludeNames,
           configFile: configFileDisplay(),
-          configSource: configOrigin.source,
+          configSource: configManager.getConfigOrigin().source,
           totalLobes: lobeInfo.length,
           degradedLobes: lobeInfo.filter((l: { health: string }) => l.health === 'degraded').length,
         };
@@ -887,8 +887,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const ctx = resolveToolContext(effectiveLobe);
         if (!ctx.ok) {
+          const availableLobes = configManager.getLobeNames();
+          if (availableLobes.length === 0) {
+            return {
+              content: [{ type: 'text', text: `No lobes configured for preferences. Run memory_bootstrap(lobe: "your-project-name", root: "/absolute/path/to/repo") first, then store the preference with prefer(rule: "...", lobe: "<your-lobe>").` }],
+              isError: true,
+            };
+          }
           return {
-            content: [{ type: 'text', text: `No global lobe configured for preferences. Specify a lobe: prefer(rule: "...", lobe: "...").\nAvailable: ${configManager.getLobeNames().join(', ')}` }],
+            content: [{ type: 'text', text: `No global lobe configured for preferences. Specify a lobe: prefer(rule: "...", lobe: "...").\nAvailable: ${availableLobes.join(', ')}` }],
             isError: true,
           };
         }
@@ -940,8 +947,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         if (!effectiveFixLobe) {
+          const availableLobes = configManager.getLobeNames();
+          if (availableLobes.length === 0) {
+            return {
+              content: [{ type: 'text', text: `No lobes configured. Run memory_bootstrap(lobe: "your-project-name", root: "/absolute/path/to/repo") first, then retry fix with the entry ID.` }],
+              isError: true,
+            };
+          }
           return {
-            content: [{ type: 'text', text: `Entry "${id}" not found in any lobe. Available: ${configManager.getLobeNames().join(', ')}` }],
+            content: [{ type: 'text', text: `Entry "${id}" not found in any lobe. Available: ${availableLobes.join(', ')}` }],
             isError: true,
           };
         }
@@ -1408,6 +1422,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (crashSection) sections.push(crashSection);
           if (degradedSection) sections.push(degradedSection);
 
+          if (allBriefingLobeNames.length === 0) {
+            sections.push(
+              '## No Lobes Configured\n\n' +
+              'No memory lobes exist yet. Run **memory_bootstrap** to create one for this project:\n\n' +
+              '```\nmemory_bootstrap(lobe: "your-project-name", root: "/absolute/path/to/repo")\n```\n\n' +
+              'After bootstrapping, call **memory_context** again to load project context.'
+            );
+            return { content: [{ type: 'text', text: sections.join('\n\n---\n\n') }] };
+          }
+
           // Collect briefing, stale entries, and entry counts across all lobes
           // (alwaysInclude lobes are in the lobe list — no separate global store query needed)
           const allStale: import('./types.js').StaleEntry[] = [];
@@ -1644,6 +1668,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Combined stats across all lobes
         const sections: string[] = [];
         const allLobeNames = configManager.getLobeNames();
+        if (allLobeNames.length === 0) {
+          return {
+            content: [{ type: 'text', text: 'No lobes configured. Run memory_bootstrap(lobe: "your-project-name", root: "/absolute/path/to/repo") first, then retry memory_stats.' }],
+          };
+        }
         const alwaysIncludeSet = new Set(configManager.getAlwaysIncludeLobes());
         for (const lobeName of allLobeNames) {
           const store = configManager.getStore(lobeName);
@@ -1661,7 +1690,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           lobe: z.string().optional(),
         }).parse(args ?? {});
 
-        const lobeName = rawLobe ?? lobeNames[0];
+        const currentLobeNames = configManager.getLobeNames();
+        const lobeName = rawLobe ?? (currentLobeNames.length === 1 ? currentLobeNames[0] : undefined);
         const ctx = resolveToolContext(lobeName);
         if (!ctx.ok) return contextError(ctx);
 
@@ -1731,9 +1761,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        // Resolve store — after this point, rawLobe is never used again
-        const ctx = resolveToolContext(rawLobe);
-        if (!ctx.ok) return contextError(ctx);
+        const effectiveLobe = rawLobe ?? (configManager.getLobeNames().length === 1 ? configManager.getLobeNames()[0] : undefined);
+        if (!effectiveLobe) {
+          return {
+            content: [{
+              type: 'text',
+              text: `memory_bootstrap requires a lobe when multiple lobes exist. Available: ${configManager.getLobeNames().join(', ')}`,
+            }],
+            isError: true,
+          };
+        }
+
+        const store = configManager.getStore(effectiveLobe);
+        if (!store) {
+          const origin = configManager.getConfigOrigin();
+          const hint = origin.source === 'file'
+            ? `Check ${origin.path} and confirm lobe "${effectiveLobe}" exists and points at a valid repo root.`
+            : `Run memory_bootstrap(lobe: "${effectiveLobe}", root: "/absolute/path/to/repo") again to create the lobe.`;
+          return {
+            content: [{
+              type: 'text',
+              text: `Bootstrap could not resolve lobe "${effectiveLobe}" after config update. ${hint}`,
+            }],
+            isError: true,
+          };
+        }
+
+        const ctx = { ok: true as const, store, label: effectiveLobe };
 
         const results = await ctx.store.bootstrap();
         const stored = results.filter((r): r is Extract<typeof r, { kind: 'stored' }> => r.kind === 'stored');
@@ -1896,7 +1950,7 @@ async function buildDiagnosticsText(showFullCrashHistory: boolean): Promise<stri
 
   // Active behavior config — shows effective values and highlights user overrides
   sections.push('### Active Behavior Config');
-  sections.push(formatBehaviorConfigSection(configBehavior));
+  sections.push(formatBehaviorConfigSection(configManager.getBehaviorConfig()));
   sections.push('');
 
   const latestCrash = await readLatestCrash();
